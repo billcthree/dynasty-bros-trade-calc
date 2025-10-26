@@ -1,0 +1,9 @@
+Key,Value,Notes
+Target_QB,3.0,Desired roster depth for QB (Superflex example)
+Target_RB,5.0,Desired roster depth for RB
+Target_WR,7.0,Desired roster depth for WR
+Target_TE,2.0,Desired roster depth for TE
+PosMult_QB,1.12,QB positional multiplier
+PosMult_RB,1.0,RB positional multiplier
+PosMult_WR,1.0,WR positional multiplier
+PosMult_TE,0.95,TE positional multiplier
