@@ -40,7 +40,7 @@ def normalize_name(name: str) -> str:
 
 
 @st.cache_data(show_spinner=False)
-def load_sleeper_league(league_id: str):
+def load_sleeper_league_v2(league_id: str):
     """
     Fetch Sleeper league info + users + rosters + records + NFL player DB + traded picks.
 
@@ -57,8 +57,7 @@ def load_sleeper_league(league_id: str):
     season = int(league_info.get("season", datetime.now().year))
     draft_rounds = int(league_info.get("draft_rounds", 4))
 
-    # We only care about picks for drafts that haven't happened yet:
-    # next 3 drafts after current season.
+    # Only care about drafts that haven't happened yet: next 3 after current season
     future_years = [season + i for i in [1, 2, 3]]
 
     users = requests.get(base + "/users", timeout=20).json()
@@ -110,8 +109,8 @@ def load_sleeper_league(league_id: str):
     )
 
     # ---------- Build future pick ownership ----------
-    # Base assumption: each roster keeps its own picks (future_years x 1..draft_rounds),
-    # then we apply /traded_picks to move them.
+    # Base assumption: each roster keeps its own picks (future_years x draft_rounds),
+    # then apply /traded_picks for final ownership.
 
     picks_current_owner = {}  # (year, round, original_roster_id) -> current_owner_team
 
@@ -125,13 +124,13 @@ def load_sleeper_league(league_id: str):
             for rnd in range(1, draft_rounds + 1):
                 picks_current_owner[(yr, rnd, rid)] = original_team
 
-    # Apply traded picks (Sleeper gives final state)
+    # Apply traded picks list (final state)
     for tp in traded or []:
         try:
             yr = int(tp.get("season", 0))
             rnd = int(tp.get("round", 0))
             orig_rid = tp.get("roster_id")
-            new_owner_rid = tp.get("owner_id")  # roster_id that now owns the pick
+            new_owner_rid = tp.get("owner_id")
         except Exception:
             continue
 
@@ -145,9 +144,8 @@ def load_sleeper_league(league_id: str):
         new_owner_team = rosterid_to_team[new_owner_rid]
         picks_current_owner[(yr, rnd, orig_rid)] = new_owner_team
 
-    # Build per-team labels + original-team map
     picks_by_team = {}  # current_owner -> [labels]
-    pick_label_to_original_team = {}  # label -> original_team_name
+    pick_label_to_original_team = {}  # label -> original team (whose record/strength matters for value)
 
     for (yr, rnd, orig_rid), current_owner in picks_current_owner.items():
         original_team = rosterid_to_team.get(orig_rid)
@@ -157,7 +155,6 @@ def load_sleeper_league(league_id: str):
         picks_by_team.setdefault(current_owner, []).append(label)
         pick_label_to_original_team[label] = original_team
 
-    # Sort labels per team for nicer UI
     for tm in picks_by_team:
         picks_by_team[tm] = sorted(picks_by_team[tm])
 
@@ -260,7 +257,7 @@ future_pick_years = []
 if use_live and league_id.strip():
     try:
         with st.spinner("Loading Sleeper league data + local FantasyPros rankings..."):
-            rosters_live, records_df, picks_by_team, pick_label_to_original, future_pick_years = load_sleeper_league(
+            rosters_live, records_df, picks_by_team, pick_label_to_original, future_pick_years = load_sleeper_league_v2(
                 league_id.strip()
             )
 
@@ -375,8 +372,8 @@ for pos in ["QB", "RB", "WR", "TE"]:
     scarcity_mult[pos] = scarcity
 
 posmult_effective = {}
-for pos, base_mult in DEFAULT_TARGETS.keys() if False else DEFAULT_POSMULT.items():
-    # base position multiplier * scarcity tweak
+for pos in ["QB", "RB", "WR", "TE"]:
+    base_mult = DEFAULT_POSMULT.get(pos, 1.0)
     posmult_effective[pos] = base_mult * scarcity_mult.get(pos, 1.0)
 
 players_df["BaseValue"] = (
