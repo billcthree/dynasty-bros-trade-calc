@@ -186,9 +186,9 @@ def load_sleeper_logos(league_id: str):
     for i, u in enumerate(users):
         meta = u.get("metadata") or {}
         team_name = meta.get("team_name") or u.get("display_name") or f"Team {i+1}"
-        avatar_url = None
-        if u.get("avatar"):
-            avatar_url = f"https://sleepercdn.com/avatars/{u['avatar']}"
+        # Prefer team-specific avatar if present, otherwise fallback to user avatar
+        avatar_id = meta.get("team_avatar") or meta.get("avatar") or u.get("avatar")
+        avatar_url = f"https://sleepercdn.com/avatars/{avatar_id}" if avatar_id else None
         owner_to_team[u.get("user_id")] = (team_name, avatar_url)
 
     team_logo = {}
@@ -201,6 +201,44 @@ def load_sleeper_logos(league_id: str):
             team_logo[team_name] = avatar_url
 
     return league_logo, team_logo
+
+
+@st.cache_data(show_spinner=False)
+def load_ppr_curves():
+    """
+    Load PPR scoring curves from data/ppr_curves.xlsx.
+
+    Expected sheets:
+      - QB24, RB24, WR24, TE24
+    Each sheet should have:
+      - '#'  : position rank (1 = top scorer at that position)
+      - 'TTL': season total PPR points
+
+    We don't match specific players here, just learn how quickly
+    each position's scoring drops off by rank.
+    """
+    try:
+        xls = pd.ExcelFile("data/ppr_curves.xlsx")
+    except Exception:
+        return None
+
+    curves = {}
+    mapping = {"QB": "QB24", "RB": "RB24", "WR": "WR24", "TE": "TE24"}
+    for pos, sheet in mapping.items():
+        if sheet not in xls.sheet_names:
+            continue
+        df = xls.parse(sheet)
+        if "#" not in df.columns or "TTL" not in df.columns:
+            continue
+        tmp = df[["#", "TTL"]].copy()
+        tmp = tmp.rename(columns={"#": "PosRank", "TTL": "Points"})
+        tmp["PosRank"] = pd.to_numeric(tmp["PosRank"], errors="coerce")
+        tmp["Points"] = pd.to_numeric(tmp["Points"], errors="coerce")
+        tmp = tmp.dropna().sort_values("PosRank")
+        if not tmp.empty:
+            curves[pos] = tmp.reset_index(drop=True)
+
+    return curves if curves else None
 
 
 # ====================================================
@@ -236,7 +274,7 @@ ELITE_GAP = st.sidebar.slider(
 )
 
 RANK_IMPORTANCE = st.sidebar.slider(
-    "How fast does value drop as rank gets worse?",
+    "How fast does value drop as players get lower in the rankings?",
     0.015, 0.060, 0.038, 0.001,
     help="Higher = rank differences matter more (e.g., Rank 26 >> Rank 137)."
 )
@@ -406,12 +444,16 @@ if league_logo:
     st.image(league_logo, width=72)
 
 # ====================================================
-# Core valuation helpers (with positional scarcity)
+# Core valuation helpers (with PPR curves & scarcity)
 # ====================================================
 
 players_df = players_df.copy()
 players_df["Rank"] = pd.to_numeric(players_df["Rank"], errors="coerce")
 players_df = players_df.dropna(subset=["Rank"]).reset_index(drop=True)
+
+# Pos-rank within each position according to FantasyPros
+players_df["Pos"] = players_df["Pos"].astype(str).str.upper().str.strip()
+players_df["PosRank"] = players_df.groupby("Pos")["Rank"].rank(method="first")
 
 # --- positional scarcity: adjust multipliers based on how many good players exist at each position ---
 TOP_CUTOFF = 100  # look at top-100 ranked players for scarcity
@@ -433,10 +475,48 @@ for pos in ["QB", "RB", "WR", "TE"]:
     base_mult = DEFAULT_POSMULT.get(pos, 1.0)
     posmult_effective[pos] = base_mult * scarcity_mult.get(pos, 1.0)
 
-players_df["BaseValue"] = (
-    ELITE_GAP * np.exp(-RANK_IMPORTANCE * (players_df["Rank"] - 1))
-).round(2)
 players_df["PosMult"] = players_df["Pos"].map(posmult_effective).fillna(1.0)
+
+# --- Use PPR curves to convert position rank -> expected points ---
+ppr_curves = load_ppr_curves()
+
+def estimate_points(row):
+    pos = row["Pos"]
+    pos_rank = row["PosRank"]
+    if not ppr_curves or pos not in ppr_curves:
+        return np.nan
+    df = ppr_curves[pos]
+    k = int(round(pos_rank))
+    subset = df[df["PosRank"] >= k]
+    if not subset.empty:
+        return float(subset.iloc[0]["Points"])
+    else:
+        return float(df["Points"].iloc[-1])
+
+players_df["ModelPoints"] = players_df.apply(estimate_points, axis=1)
+
+# Fallback if curves missing or partial
+if players_df["ModelPoints"].isna().any():
+    fallback_idx = players_df["ModelPoints"].isna()
+    max_rank = players_df["Rank"].max()
+    # simple fallback: higher FP rank -> more "points"
+    players_df.loc[fallback_idx, "ModelPoints"] = (
+        max_rank - players_df.loc[fallback_idx, "Rank"] + 1
+    )
+
+max_pts = players_df["ModelPoints"].max()
+if max_pts <= 0:
+    # Hard fallback: old exponential by overall rank
+    players_df["BaseValue"] = (
+        ELITE_GAP * np.exp(-RANK_IMPORTANCE * (players_df["Rank"] - 1))
+    ).round(2)
+else:
+    # Steepness derived from RANK_IMPORTANCE slider
+    # 0.015 -> ~1.0; 0.060 -> ~1.9
+    steep = 1.0 + (RANK_IMPORTANCE - 0.015) * 20.0
+    norm = players_df["ModelPoints"] / max_pts
+    norm = norm.clip(lower=0.0001)  # avoid zero
+    players_df["BaseValue"] = (ELITE_GAP * np.power(norm, steep)).round(2)
 
 def team_pos_counts(team: str):
     names = set(rosters_df.loc[rosters_df["Team"] == team, "Player"].tolist())
@@ -602,7 +682,7 @@ def needs_and_risk_summary(team, before_counts, after_counts, incoming_details):
         inc_counts[pos] = inc_counts.get(pos, 0) + 1
 
     for pos in ["QB", "RB", "WR", "TE"]:
-        tgt = int(targets.get(pos, 0))
+        tgt = int(DEFAULT_TARGETS.get(pos, 0))
         before = before_counts.get(pos, 0)
         after = after_counts.get(pos, 0)
         inc = inc_counts.get(pos, 0)
@@ -611,7 +691,8 @@ def needs_and_risk_summary(team, before_counts, after_counts, incoming_details):
         if inc > 0 and before < tgt:
             if before == 0 and pos == "QB":
                 notes.append(
-                    f"{team} badly needs a starting QB, so adding a QB here is especially valuable."
+                    f"{team} badly needs a starting QB (goes from {before} to {after}). "
+                    f"Adding a QB here is especially valuable."
                 )
             else:
                 notes.append(
@@ -652,138 +733,173 @@ with tab_trade:
         if teamB in team_logo_map:
             st.image(team_logo_map[teamB], width=40)
 
-    a_players_list = roster_players(teamA) if teamA else []
-    b_players_list = roster_players(teamB) if teamB else []
+    if not teamA or not teamB:
+        st.info("Once your Sleeper league loads, pick two teams and add players/picks to see a trade evaluation.")
+    else:
+        a_players_list = roster_players(teamA)
+        b_players_list = roster_players(teamB)
 
-    left, right = st.columns(2)
-    with left:
-        st.markdown(f"#### {teamA} sends → {teamB}")
-        a_send_players = st.multiselect(
-            "Players",
-            a_players_list,
-            format_func=lambda x: label_map.get(x, x),
-            key="a_send_players",
-        )
-        a_send_picks = st.multiselect(
-            "Picks",
-            build_pick_labels_for_team(teamA) if teamA else [],
-            key="a_send_picks",
-        )
-    with right:
-        st.markdown(f"#### {teamB} sends → {teamA}")
-        b_send_players = st.multiselect(
-            "Players",
-            b_players_list,
-            format_func=lambda x: label_map.get(x, x),
-            key="b_send_players",
-        )
-        b_send_picks = st.multiselect(
-            "Picks",
-            build_pick_labels_for_team(teamB) if teamB else [],
-            key="b_send_picks",
-        )
+        left, right = st.columns(2)
+        with left:
+            st.markdown(f"#### {teamA} sends → {teamB}")
+            a_send_players = st.multiselect(
+                "Players",
+                a_players_list,
+                format_func=lambda x: label_map.get(x, x),
+                key="a_send_players",
+            )
+            a_send_picks = st.multiselect(
+                "Picks",
+                build_pick_labels_for_team(teamA),
+                key="a_send_picks",
+            )
+        with right:
+            st.markdown(f"#### {teamB} sends → {teamA}")
+            b_send_players = st.multiselect(
+                "Players",
+                b_players_list,
+                format_func=lambda x: label_map.get(x, x),
+                key="b_send_players",
+            )
+            b_send_picks = st.multiselect(
+                "Picks",
+                build_pick_labels_for_team(teamB),
+                key="b_send_picks",
+            )
 
-    if not manual or recalc:
-        # Value each side RECEIVES
-        A_get_players, A_get_p_det = sum_players_value(b_send_players, teamA)
-        A_get_picks,   A_get_pk_det = sum_picks_value(b_send_picks)
-        A_get_total = A_get_players + A_get_picks
-
-        B_get_players, B_get_p_det = sum_players_value(a_send_players, teamB)
-        B_get_picks,   B_get_pk_det = sum_picks_value(a_send_picks)
-        B_get_total = B_get_players + B_get_picks
-
-        m1, m2 = st.columns(2)
-        m1.metric(f"{teamA} receives (rank-based value)", f"{A_get_total:,.0f}")
-        m2.metric(f"{teamB} receives (rank-based value)", f"{B_get_total:,.0f}")
-
-        # Roster counts before/after for more transparent notes
-        countsA_before = team_pos_counts(teamA)
-        countsB_before = team_pos_counts(teamB)
-        countsA_after = counts_after_trade(teamA, a_send_players, b_send_players)
-        countsB_after = counts_after_trade(teamB, b_send_players, a_send_players)
-
-        A_notes = needs_and_risk_summary(teamA, countsA_before, countsA_after, A_get_p_det)
-        B_notes = needs_and_risk_summary(teamB, countsB_before, countsB_after, B_get_p_det)
-
-        st.markdown("---")
-        st.subheader("Fairness Verdict")
-
-        diff = A_get_total - B_get_total
-        larger = max(A_get_total, B_get_total, 1.0)
-        pct = diff / larger
-
-        def grade(pct_diff: float) -> str:
-            ad = abs(pct_diff)
-            if ad < 0.05:
-                return "Overall this looks fair for both sides."
-            elif ad < 0.12:
-                return "One side has a small edge, but it’s still reasonable."
+        if not manual or recalc:
+            if not (a_send_players or a_send_picks or b_send_players or b_send_picks):
+                st.info("Build a trade by selecting at least one player or pick on either side.")
             else:
-                return "This is a clear win for the side getting more value."
+                # Value each side RECEIVES
+                A_get_players, A_get_p_det = sum_players_value(b_send_players, teamA)
+                A_get_picks,   A_get_pk_det = sum_picks_value(b_send_picks)
+                A_get_total = A_get_players + A_get_picks
 
-        THRESH = 0.03
-        if abs(pct) < THRESH:
-            msg = (
-                f"Based on FantasyPros rankings, this looks like a **fair trade** – "
-                f"{teamA} and {teamB} receive very similar value. "
-                f"{grade(pct)}"
-            )
-            st.success(msg)
-        elif pct > 0:
-            msg = (
-                f"**Trade favors {teamA}** by {diff:,.0f} (~{pct:.1%}). "
-                f"{grade(pct)}"
-            )
-            st.info(msg)
-        else:
-            msg = (
-                f"**Trade favors {teamB}** by {abs(diff):,.0f} (~{abs(pct):.1%}). "
-                f"{grade(pct)}"
-            )
-            st.info(msg)
+                B_get_players, B_get_p_det = sum_players_value(a_send_players, teamB)
+                B_get_picks,   B_get_pk_det = sum_picks_value(a_send_picks)
+                B_get_total = B_get_players + B_get_picks
 
-        # Extra context: why a manager might like or hate it
-        st.markdown("##### Roster context (why someone might like or dislike this trade)")
-        if A_notes:
-            st.write(f"**For {teamA}:**")
-            for n in A_notes[:3]:
-                st.write("- " + n)
-        if B_notes:
-            st.write(f"**For {teamB}:**")
-            for n in B_notes[:3]:
-                st.write("- " + n)
-        if not (A_notes or B_notes):
-            st.caption(
-                "Neither team has obvious positional red flags in this deal. "
-                "At that point, it often comes down to personal preference, age windows, "
-                "and risk tolerance."
-            )
+                m1, m2 = st.columns(2)
+                m1.metric(f"{teamA} receives (model value)", f"{A_get_total:,.0f}")
+                m2.metric(f"{teamB} receives (model value)", f"{B_get_total:,.0f}")
 
-        # Show key pieces w/ FantasyPros rank
-        def key_pieces(details):
-            if not details:
-                return []
-            df = pd.DataFrame(details, columns=["Player", "Pos", "FP Rank", "Base Value", "Need Mult", "Final Value"])
-            df = df.sort_values("Final Value", ascending=False)
-            return df.head(5)
+                # Roster counts before/after for more transparent notes
+                countsA_before = team_pos_counts(teamA)
+                countsB_before = team_pos_counts(teamB)
+                countsA_after = counts_after_trade(teamA, a_send_players, b_send_players)
+                countsB_after = counts_after_trade(teamB, b_send_players, a_send_players)
 
-        with st.expander("See why: player ranks and values used"):
-            st.write(f"**What {teamA} receives (players)** — including FantasyPros Superflex PPR ranks")
-            dfA = key_pieces(A_get_p_det)
-            if not dfA.empty:
-                st.table(dfA)
-            if A_get_pk_det:
-                st.write(f"**Picks to {teamA}**")
-                st.table(pd.DataFrame(A_get_pk_det, columns=["Pick", "Value"]))
+                A_notes = needs_and_risk_summary(teamA, countsA_before, countsA_after, A_get_p_det)
+                B_notes = needs_and_risk_summary(teamB, countsB_before, countsB_after, B_get_p_det)
 
-            st.write(f"**What {teamB} receives (players)** — including FantasyPros Superflex PPR ranks")
-            dfB = key_pieces(B_get_p_det)
-            if not dfB.empty:
-                st.table(dfB)
-            if B_get_pk_det:
-                st.write(f"**Picks to {teamB}**")
-                st.table(pd.DataFrame(B_get_pk_det, columns=["Pick", "Value"]))
+                st.markdown("---")
+                st.subheader("Fairness verdict")
+
+                diff = A_get_total - B_get_total
+                larger = max(A_get_total, B_get_total, 1.0)
+                pct = diff / larger
+
+                def grade(pct_diff: float) -> str:
+                    """Soft language explanation of how lopsided things look."""
+                    ad = abs(pct_diff)
+                    if ad < 0.05:
+                        return "The numbers here are very close, so both sides could reasonably feel okay about it."
+                    elif ad < 0.12:
+                        return "One side has a modest edge by the numbers, but it's still within a range where both managers might be comfortable."
+                    else:
+                        return "One side is getting a noticeable edge on pure value; the other side would likely need strong non-numbers reasons (team fit, age profile, risk) to accept."
+
+                # Which team the model slightly favors
+                if abs(pct) < 0.03:
+                    headline = (
+                        f"By the model, this trade is roughly **even**. "
+                        f"{teamA} and {teamB} are getting similar overall value."
+                    )
+                elif pct > 0:
+                    headline = (
+                        f"This trade **likely favors {teamA}**. "
+                        f"Our model has {teamA} receiving about **{abs(diff):,.0f} more value points** "
+                        f"than {teamB}, which is roughly **{abs(pct)*100:.1f}% more** than what {teamB} is getting."
+                    )
+                else:
+                    headline = (
+                        f"This trade **likely favors {teamB}**. "
+                        f"Our model has {teamB} receiving about **{abs(diff):,.0f} more value points** "
+                        f"than {teamA}, which is roughly **{abs(pct)*100:.1f}% more** than what {teamA} is getting."
+                    )
+
+                st.write(headline)
+                st.caption(
+                    "“Value points” are on this app’s internal scale – higher means more expected future production. "
+                    "The % compares the two sides to show how far apart they are."
+                )
+                st.info(grade(pct))
+
+                # Quick summary of main pieces on each side
+                def summarize_side(details):
+                    if not details:
+                        return ""
+                    df = pd.DataFrame(details, columns=["Player", "Pos", "FP Rank", "Base Value", "Need Mult", "Final Value"])
+                    df = df.sort_values("Final Value", ascending=False)
+                    tops = df.head(2)
+                    parts = []
+                    for _, r in tops.iterrows():
+                        parts.append(f"{r['Player']} (Rank {int(r['FP Rank'])} {r['Pos']})")
+                    return ", ".join(parts)
+
+                A_summary = summarize_side(A_get_p_det)
+                B_summary = summarize_side(B_get_p_det)
+
+                if A_summary or B_summary:
+                    st.markdown("**Biggest pieces each side is getting (by this model):**")
+                    if A_summary:
+                        st.markdown(f"- {teamA} is mainly gaining: {A_summary}.")
+                    if B_summary:
+                        st.markdown(f"- {teamB} is mainly gaining: {B_summary}.")
+
+                # Extra context: why a manager might like or hate it
+                st.markdown("### Roster context — why managers might feel differently")
+
+                if A_notes:
+                    st.markdown(f"**For {teamA}:**")
+                    for n in A_notes[:4]:
+                        st.markdown(f"- {n}")
+                if B_notes:
+                    st.markdown(f"**For {teamB}:**")
+                    for n in B_notes[:4]:
+                        st.markdown(f"- {n}")
+                if not (A_notes or B_notes):
+                    st.info(
+                        "Neither team has obvious positional red flags in this deal. "
+                        "At that point, it often comes down to personal preference, age windows, "
+                        "and risk tolerance."
+                    )
+
+                # Show key pieces w/ FantasyPros rank
+                def key_pieces(details):
+                    if not details:
+                        return pd.DataFrame()
+                    df = pd.DataFrame(details, columns=["Player", "Pos", "FP Rank", "Base Value", "Need Mult", "Final Value"])
+                    df = df.sort_values("Final Value", ascending=False)
+                    return df.head(5)
+
+                with st.expander("See the numbers behind this suggestion (FantasyPros ranks & model values)"):
+                    st.write(f"**What {teamA} receives (players)** — including FantasyPros Superflex PPR ranks")
+                    dfA = key_pieces(A_get_p_det)
+                    if not dfA.empty:
+                        st.table(dfA)
+                    if A_get_pk_det:
+                        st.write(f"**Picks to {teamA}**")
+                        st.table(pd.DataFrame(A_get_pk_det, columns=["Pick", "Value"]))
+
+                    st.write(f"**What {teamB} receives (players)** — including FantasyPros Superflex PPR ranks")
+                    dfB = key_pieces(B_get_p_det)
+                    if not dfB.empty:
+                        st.table(dfB)
+                    if B_get_pk_det:
+                        st.write(f"**Picks to {teamB}**")
+                        st.table(pd.DataFrame(B_get_pk_det, columns=["Pick", "Value"]))
 
 
 # ----------------------------------------------------
@@ -833,7 +949,7 @@ with tab_finder:
 
     from_counts = team_pos_counts(tf_from)
     def surplus_score(pos):
-        return max(0, from_counts.get(pos, 0) - targets.get(pos, 0))
+        return max(0, from_counts.get(pos, 0) - DEFAULT_TARGETS.get(pos, 0))
 
     cand["ValueToPartner"] = cand["Player"].apply(val_to_partner)
     cand["Surplus"] = cand["Pos"].apply(surplus_score)
@@ -900,7 +1016,7 @@ with tab_finder:
 
     uniq.sort(key=lambda x: (len(x[0]), abs(x[1] - target_val), -x[1]))
 
-    st.markdown("#### Suggested Packages")
+    st.markdown("#### Suggested packages")
     if not uniq:
         st.write(
             "No clean suggestions found in the 90–110% range. "
@@ -909,7 +1025,7 @@ with tab_finder:
     else:
         for i, (assets, v) in enumerate(uniq[:5], start=1):
             pct = v / target_val if target_val > 0 else 0
-            st.write(f"**Suggestion {i}** — value to {tf_to}: {v:,.0f} (~{pct:.0%} of target)")
+            st.write(f"**Suggestion {i}** — value to {tf_to}: {v:,.0f} (~{pct:.0%} of the target player's value)")
             st.write("- " + "\n- ".join(assets))
 
 # ----------------------------------------------------
@@ -919,15 +1035,24 @@ with st.expander("How this calculator works & assumptions"):
     st.markdown(
         """
 - **Player values** start from FantasyPros **Dynasty Superflex PPR** ranks  
-  (lower rank number = better player). We turn rank into a value curve, so
-  Rank 10 is much more valuable than Rank 110.
+  (lower rank number = better player).
+- We then look at last season's **PPR scoring curves** by position  
+  (QB / RB / WR / TE) from your `data/ppr_curves.xlsx` file:
+  - For example, WR1 vs WR10 vs WR25 – how many points they scored over the year.
+  - This helps flatten spots where there are tons of usable players (like mid WR)
+    and keep bigger gaps where the scoring really falls off.
+- For each player:
+  - We find their **position rank** (e.g., WR8) using FantasyPros.
+  - We map that to an expected PPR total based on historical curves.
+  - We normalize across all players so the very top asset is around your
+    “How valuable is the #1 player?” slider.
 - **Position value** is adjusted two ways:
   - A small fixed bump (QB a bit higher, TE a bit lower by default).
   - A **scarcity tweak**: if there are very few top QBs / TEs, they get a little extra
     weight vs positions with tons of solid options.
 - **Roster needs**: if a team is light at a position (e.g. only one QB), incoming
   players at that position get a small boost. This is intentionally a light touch –
-  rankings still matter much more than depth.
+  rankings and the PPR curves still matter much more than depth.
 - **Package penalty**: multiple mid-range players don't fully equal one elite player.
   A 2-for-1 tax is applied so the stud usually wins.
 - **Future picks**:
@@ -937,8 +1062,10 @@ with st.expander("How this calculator works & assumptions"):
     not who owns it now. Bad teams' future 1sts are worth a lot.
   - Further-out picks are discounted a bit (you can adjust this in the sidebar).
 - **Fairness** is a guideline, not a rule:
-  - The app tells you who “wins” *by the numbers*.
+  - The app tells you which side it thinks is getting more value *by the numbers*.
   - The roster notes explain why a real manager might still accept or reject
     a deal (QB depth, RB youth, competing vs rebuilding, etc.).
+  - Upside, injuries, personal player takes, and league-specific quirks will
+    always matter too.
 """
     )
