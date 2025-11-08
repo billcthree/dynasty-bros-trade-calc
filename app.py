@@ -37,83 +37,7 @@ def normalize_name(name: str) -> str:
     return " ".join(tokens)
 
 
-@st.cache_data(show_spinner=False)
-def load_fantasypros_rankings() -> pd.DataFrame:
-    """
-    Scrape FantasyPros dynasty overall ranks and return:
-    columns: Player, Pos, Rank
 
-    We fetch the HTML ourselves with a browser-like User-Agent, then
-    let pandas.read_html parse the first table.
-    """
-    url = "https://www.fantasypros.com/nfl/rankings/dynasty-overall.php"
-
-    # Fetch the page with a friendly User-Agent so the site doesn't block us
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0 Safari/537.36"
-        )
-    }
-    resp = requests.get(url, headers=headers, timeout=20)
-    resp.raise_for_status()
-    html = resp.text
-
-    # Parse tables from the HTML text
-    tables = pd.read_html(html)
-    if not tables:
-        raise ValueError("No tables found in FantasyPros page")
-
-    df = tables[0]
-
-    # Try to find rank & player columns generically
-    rank_col = None
-    for c in df.columns:
-        if "Rank" in str(c) or "#" in str(c):
-            rank_col = c
-            break
-    if rank_col is None:
-        rank_col = df.columns[0]
-
-    player_col = None
-    for c in df.columns:
-        if "Player" in str(c):
-            player_col = c
-            break
-    if player_col is None:
-        player_col = df.columns[1]
-
-    slim = df[[rank_col, player_col]].copy()
-    slim.columns = ["Rank", "PlayerRaw"]
-
-    # Parse "PlayerRaw" -> Player, Pos
-    def parse_player(raw):
-        s = str(raw).strip()
-        toks = s.split()
-        if len(toks) >= 3:
-            pos = toks[-1]
-            # team = toks[-2]  # not used
-            name = " ".join(toks[:-2])
-        elif len(toks) >= 2:
-            pos = toks[-1]
-            name = " ".join(toks[:-1])
-        else:
-            pos = ""
-            name = s
-        return pd.Series({"Player": name, "Pos": pos})
-
-    parsed = slim["PlayerRaw"].apply(parse_player)
-    out = pd.concat([slim["Rank"], parsed], axis=1)
-    out["Rank"] = pd.to_numeric(out["Rank"], errors="coerce")
-    out = out.dropna(subset=["Rank"]).reset_index(drop=True)
-    out["Pos"] = out["Pos"].str.upper().str.strip()
-    out = out[out["Pos"].isin(["QB", "RB", "WR", "TE"])]
-    out["Norm"] = out["Player"].apply(normalize_name)
-
-    # If duplicates after normalization, keep the best (lowest rank)
-    out = out.sort_values("Rank").drop_duplicates("Norm", keep="first").reset_index(drop=True)
-    return out
 
 
     # Try to find rank & player columns generically
@@ -306,13 +230,50 @@ DEFAULT_POSMULT = {"QB": 1.10, "RB": 1.00, "WR": 1.00, "TE": 0.95}
 # ------------- Load live data or CSV ----------------
 if use_live and league_id.strip():
     try:
-        with st.spinner("Loading FantasyPros rankings + Sleeper league data..."):
-            fp_ranks = load_fantasypros_rankings()
+        with st.spinner("Loading Sleeper league data + local FantasyPros CSV..."):
+            # Load rosters & records from Sleeper
             rosters_live, records_df = load_sleeper_league(league_id.strip())
 
-        # Merge Sleeper names with FP ranks using normalized names
+            # Load rankings from bundled CSV (FantasyPros export)
+            fp_ranks = pd.read_csv("data/player_ranks.csv")
+            fp_ranks["Pos"] = fp_ranks["Pos"].astype(str).str.upper().str.strip()
+            fp_ranks["Rank"] = pd.to_numeric(fp_ranks["Rank"], errors="coerce")
+            fp_ranks = fp_ranks.dropna(subset=["Rank"]).reset_index(drop=True)
+            fp_ranks["Norm"] = fp_ranks["Player"].apply(normalize_name)
+
         fp_max_rank = int(fp_ranks["Rank"].max())
         fp2 = fp_ranks.copy()
+
+        roster_enriched = rosters_live.copy()
+        roster_enriched["Norm"] = roster_enriched["Player"].apply(normalize_name)
+        roster_enriched = roster_enriched.merge(
+            fp2[["Norm", "Rank", "Pos"]].rename(columns={"Pos": "FP_Pos"}),
+            on="Norm",
+            how="left"
+        )
+
+        roster_enriched["Pos_use"] = roster_enriched["FP_Pos"].fillna(roster_enriched["Pos"])
+        roster_enriched["Rank_use"] = roster_enriched["Rank"].fillna(fp_max_rank + 80)
+
+        players_df = (
+            roster_enriched[["Player", "Pos_use", "Rank_use"]]
+            .drop_duplicates("Player")
+            .rename(columns={"Pos_use": "Pos", "Rank_use": "Rank"})
+        )
+
+        rosters_df = roster_enriched[["Team", "Player"]].copy()
+
+        targets = DEFAULT_TARGETS
+        posmult = DEFAULT_POSMULT
+
+        st.success("Loaded Sleeper rosters + local FantasyPros rankings.")
+    except Exception as e:
+        st.error(f"Live data load failed: {e}")
+        st.info("Falling back to CSV uploads (if provided).")
+        use_live = False
+else:
+    use_live = False
+
         fp2["Norm"] = fp2["Player"].apply(normalize_name)
 
         roster_enriched = rosters_live.copy()
