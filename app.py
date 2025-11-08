@@ -13,12 +13,12 @@ st.set_page_config(
 )
 st.title("Dynasty Bros. Trade Calculator (using FantasyPros Rankings + AI Generated Team Needs)")
 st.caption(
-    "FantasyPros dynasty ranks + Sleeper rosters. "
-    "Rank-first values with light team-need seasoning. Picks scaled by roster strength + record."
+    "FantasyPros dynasty ranks + live Sleeper rosters. "
+    "Rank-first values with light team-need seasoning. Picks scaled by roster strength, record, and original team."
 )
 
 # ====================================================
-# Helpers: name normalization, Sleeper fetch
+# Helpers: name normalization, Sleeper fetch w/ picks
 # ====================================================
 
 def normalize_name(name: str) -> str:
@@ -42,17 +42,31 @@ def normalize_name(name: str) -> str:
 @st.cache_data(show_spinner=False)
 def load_sleeper_league(league_id: str):
     """
-    Fetch Sleeper users + rosters + records + NFL player DB.
+    Fetch Sleeper league info + users + rosters + records + NFL player DB + traded picks.
+
     Returns:
       rosters_df: Team, Player, Pos
       records_df: Team, Wins, Losses, Ties
+      picks_by_team: { current_owner_team: [pick_label, ...] }
+      pick_label_to_original_team: { pick_label: original_team_name }
+      future_years: list[int] of seasons we built picks for
     """
     base = f"https://api.sleeper.app/v1/league/{league_id}"
+
+    league_info = requests.get(base, timeout=20).json()
+    season = int(league_info.get("season", datetime.now().year))
+    draft_rounds = int(league_info.get("draft_rounds", 4))
+
+    # We only care about picks for drafts that haven't happened yet:
+    # next 3 drafts after current season.
+    future_years = [season + i for i in [1, 2, 3]]
+
     users = requests.get(base + "/users", timeout=20).json()
     rosts = requests.get(base + "/rosters", timeout=20).json()
+    traded = requests.get(base + "/traded_picks", timeout=20).json()
     players_nfl = requests.get("https://api.sleeper.app/v1/players/nfl", timeout=30).json()
 
-    # Map owner_id -> display/team name
+    # Map owner_id -> nice team name
     id_to_name = {}
     for i, u in enumerate(users):
         meta = u.get("metadata") or {}
@@ -61,9 +75,14 @@ def load_sleeper_league(league_id: str):
 
     rows = []
     records = {}
+    rosterid_to_team = {}
+
     for r in rosts:
         owner_id = r.get("owner_id")
-        team_label = id_to_name.get(owner_id, f"Team {r.get('roster_id', '?')}")
+        roster_id = r.get("roster_id")
+        team_label = id_to_name.get(owner_id, f"Team {roster_id}")
+        rosterid_to_team[roster_id] = team_label
+
         settings = r.get("settings") or {}
         wins = settings.get("wins", 0)
         losses = settings.get("losses", 0)
@@ -89,7 +108,60 @@ def load_sleeper_league(league_id: str):
     records_df = pd.DataFrame(records.values()) if records else pd.DataFrame(
         columns=["Team", "Wins", "Losses", "Ties"]
     )
-    return rosters_df, records_df
+
+    # ---------- Build future pick ownership ----------
+    # Base assumption: each roster keeps its own picks (future_years x 1..draft_rounds),
+    # then we apply /traded_picks to move them.
+
+    picks_current_owner = {}  # (year, round, original_roster_id) -> current_owner_team
+
+    # Initial ownership = original owner
+    for r in rosts:
+        rid = r.get("roster_id")
+        original_team = rosterid_to_team.get(rid)
+        if not original_team:
+            continue
+        for yr in future_years:
+            for rnd in range(1, draft_rounds + 1):
+                picks_current_owner[(yr, rnd, rid)] = original_team
+
+    # Apply traded picks (Sleeper gives final state)
+    for tp in traded or []:
+        try:
+            yr = int(tp.get("season", 0))
+            rnd = int(tp.get("round", 0))
+            orig_rid = tp.get("roster_id")
+            new_owner_rid = tp.get("owner_id")  # roster_id that now owns the pick
+        except Exception:
+            continue
+
+        if yr not in future_years:
+            continue
+        if rnd < 1 or rnd > draft_rounds:
+            continue
+        if orig_rid not in rosterid_to_team or new_owner_rid not in rosterid_to_team:
+            continue
+
+        new_owner_team = rosterid_to_team[new_owner_rid]
+        picks_current_owner[(yr, rnd, orig_rid)] = new_owner_team
+
+    # Build per-team labels + original-team map
+    picks_by_team = {}  # current_owner -> [labels]
+    pick_label_to_original_team = {}  # label -> original_team_name
+
+    for (yr, rnd, orig_rid), current_owner in picks_current_owner.items():
+        original_team = rosterid_to_team.get(orig_rid)
+        if not original_team or not current_owner:
+            continue
+        label = f"{yr} R{rnd} ({original_team})"
+        picks_by_team.setdefault(current_owner, []).append(label)
+        pick_label_to_original_team[label] = original_team
+
+    # Sort labels per team for nicer UI
+    for tm in picks_by_team:
+        picks_by_team[tm] = sorted(picks_by_team[tm])
+
+    return rosters_df, records_df, picks_by_team, pick_label_to_original_team, future_years
 
 
 # ====================================================
@@ -101,7 +173,7 @@ st.sidebar.header("1) Data Source")
 use_live = st.sidebar.checkbox(
     "Use live Sleeper + FantasyPros data",
     value=True,
-    help="On: rosters + records from Sleeper API, rankings from data/player_ranks.csv (FantasyPros export)."
+    help="On: rosters/records from Sleeper API, rankings from data/player_ranks.csv (FantasyPros export)."
 )
 
 league_id = st.sidebar.text_input(
@@ -148,9 +220,9 @@ N_STRENGTH = st.sidebar.slider(
 )
 
 PICK_MAX = st.sidebar.slider(
-    "Pick max (value for 1.01)",
+    "Pick max (value for earliest 1st)",
     250.0, 900.0, 500.0, 25.0,
-    help="Max value for the very best first-round pick."
+    help="Max value for the very earliest first-round pick."
 )
 
 PICK_SLOT_DECAY = st.sidebar.slider(
@@ -179,12 +251,18 @@ if manual:
 DEFAULT_TARGETS = {"QB": 2, "RB": 4, "WR": 5, "TE": 2}
 DEFAULT_POSMULT = {"QB": 1.10, "RB": 1.00, "WR": 1.00, "TE": 0.95}
 
+# These will be filled depending on mode
+picks_by_team = {}
+pick_label_to_original = {}
+future_pick_years = []
+
 # ---- Live mode: Sleeper + local FantasyPros CSV ----
 if use_live and league_id.strip():
     try:
         with st.spinner("Loading Sleeper league data + local FantasyPros rankings..."):
-            # Sleeper rosters + records
-            rosters_live, records_df = load_sleeper_league(league_id.strip())
+            rosters_live, records_df, picks_by_team, pick_label_to_original, future_pick_years = load_sleeper_league(
+                league_id.strip()
+            )
 
             # Rankings from bundled CSV (FantasyPros export you maintain)
             fp_ranks = pd.read_csv("data/player_ranks.csv")
@@ -259,18 +337,52 @@ if not use_live:
     targets = DEFAULT_TARGETS
     posmult = DEFAULT_POSMULT
 
+    # Generic picks (no traded info) – future 3 drafts
+    current_year = datetime.now().year
+    future_pick_years = [current_year + i for i in [1, 2, 3]]
+    picks_by_team = {}
+    pick_label_to_original = {}
+    for tm in rosters_df["Team"].unique():
+        for yr in future_pick_years:
+            for rnd in [1, 2, 3, 4]:
+                label = f"{yr} R{rnd} ({tm})"
+                picks_by_team.setdefault(tm, []).append(label)
+                pick_label_to_original[label] = tm
+    for tm in picks_by_team:
+        picks_by_team[tm] = sorted(picks_by_team[tm])
+
 # ====================================================
-# Core valuation helpers
+# Core valuation helpers (with positional scarcity)
 # ====================================================
 
 players_df = players_df.copy()
 players_df["Rank"] = pd.to_numeric(players_df["Rank"], errors="coerce")
 players_df = players_df.dropna(subset=["Rank"]).reset_index(drop=True)
 
+# --- positional scarcity: adjust multipliers based on how many good players exist at each position ---
+TOP_CUTOFF = 100  # look at top-100 ranked players for scarcity
+top_slice = players_df[players_df["Rank"] <= TOP_CUTOFF]
+counts = top_slice["Pos"].value_counts()
+avg_count = counts.mean() if len(counts) else 1.0
+
+scarcity_mult = {}
+for pos in ["QB", "RB", "WR", "TE"]:
+    c = counts.get(pos, 1)  # number of top players at this pos
+    raw = avg_count / c  # >1 if scarce, <1 if abundant
+    raw_clamped = max(0.5, min(2.0, raw))
+    # Map raw_clamped in [0.5, 2.0] into [0.85, 1.15]
+    scarcity = 0.85 + (raw_clamped - 0.5) * (1.15 - 0.85) / (2.0 - 0.5)
+    scarcity_mult[pos] = scarcity
+
+posmult_effective = {}
+for pos, base_mult in DEFAULT_TARGETS.keys() if False else DEFAULT_POSMULT.items():
+    # base position multiplier * scarcity tweak
+    posmult_effective[pos] = base_mult * scarcity_mult.get(pos, 1.0)
+
 players_df["BaseValue"] = (
     ELITE_GAP * np.exp(-RANK_IMPORTANCE * (players_df["Rank"] - 1))
 ).round(2)
-players_df["PosMult"] = players_df["Pos"].map(posmult).fillna(1.0)
+players_df["PosMult"] = players_df["Pos"].map(posmult_effective).fillna(1.0)
 
 def team_pos_counts(team: str):
     names = set(rosters_df.loc[rosters_df["Team"] == team, "Player"].tolist())
@@ -311,7 +423,7 @@ def team_strength(team: str):
     vals = (sub["BaseValue"] * sub["PosMult"]).sort_values(ascending=False).head(N_STRENGTH)
     return float(vals.sum()) if len(vals) else 0.0
 
-# Build strengths & record-based ranking for picks
+# Build strengths & record-based ranking for picks (by ORIGINAL team)
 team_list = sorted(rosters_df["Team"].unique().tolist())
 strengths = {t: team_strength(t) for t in team_list}
 
@@ -339,7 +451,7 @@ def pick_base_value(slot: int, rnd: int) -> float:
     slot_val = np.exp(-PICK_SLOT_DECAY * (slot - 1))  # earlier slot => larger value
     return PICK_MAX * round_mult * slot_val
 
-def pick_value(team: str, year: int, rnd: int) -> float:
+def pick_value(original_team: str, year: int, rnd: int) -> float:
     current_year = datetime.now().year
     diff = year - current_year
     if diff <= 0:
@@ -349,33 +461,31 @@ def pick_value(team: str, year: int, rnd: int) -> float:
     else:
         year_mult = YEAR3_DISC ** diff
 
-    slot = team_pick_slot.get(team, len(team_list))
+    slot = team_pick_slot.get(original_team, len(team_list))
     base = pick_base_value(slot, rnd)
     return round(base * year_mult, 1)
 
 def build_pick_labels_for_team(team: str):
-    labels = []
-    years = [datetime.now().year + i for i in [0, 1, 2]]
-    for yr in years:
-        for r in [1, 2, 3, 4]:
-            labels.append(f"{yr} R{r} ({team})")
-    return labels
+    # In live mode, this uses picks_by_team (includes trades, only future drafts).
+    # In CSV mode, picks_by_team was built generically above.
+    return picks_by_team.get(team, [])
 
 def parse_pick_label(label: str):
     try:
         parts = label.split()
         yr = int(parts[0])
         rnd = int(parts[1].replace("R", ""))
-        team = label[label.find("(") + 1:label.find(")")]
-        return yr, rnd, team
+        # team in parentheses is ORIGINAL team (whose record/strength matters)
+        original_team = label[label.find("(") + 1:label.find(")")]
+        return yr, rnd, original_team
     except Exception:
         return None, None, None
 
 def label_value(lbl: str) -> float:
-    yr, rnd, tm = parse_pick_label(lbl)
+    yr, rnd, original_team = parse_pick_label(lbl)
     if yr is None:
         return 0.0
-    return pick_value(tm, yr, rnd)
+    return pick_value(original_team, yr, rnd)
 
 def package_sum(values):
     if not values:
@@ -427,17 +537,17 @@ with tab_trade:
 
     colA, colB = st.columns(2)
     with colA:
-        teamA = st.selectbox("Team A", team_list, index=0 if team_list else None)
+        teamA = st.selectbox("Team A (left side)", team_list, index=0 if team_list else None)
     with colB:
         teamB_choices = [t for t in team_list if t != (teamA if team_list else None)]
-        teamB = st.selectbox("Team B", teamB_choices, index=0 if teamB_choices else None)
+        teamB = st.selectbox("Team B (right side)", teamB_choices, index=0 if teamB_choices else None)
 
     a_players_list = roster_players(teamA) if teamA else []
     b_players_list = roster_players(teamB) if teamB else []
 
     left, right = st.columns(2)
     with left:
-        st.markdown("#### Team A sends → Team B")
+        st.markdown(f"#### {teamA} sends → {teamB}")
         a_send_players = st.multiselect(
             "Players",
             a_players_list,
@@ -450,7 +560,7 @@ with tab_trade:
             key="a_send_picks",
         )
     with right:
-        st.markdown("#### Team B sends → Team A")
+        st.markdown(f"#### {teamB} sends → {teamA}")
         b_send_players = st.multiselect(
             "Players",
             b_players_list,
@@ -474,8 +584,8 @@ with tab_trade:
         B_get_total = B_get_players + B_get_picks
 
         m1, m2 = st.columns(2)
-        m1.metric("Team A receives (rank-first value)", f"{A_get_total:,.0f}")
-        m2.metric("Team B receives (rank-first value)", f"{B_get_total:,.0f}")
+        m1.metric(f"{teamA} receives (rank-first value)", f"{A_get_total:,.0f}")
+        m2.metric(f"{teamB} receives (rank-first value)", f"{B_get_total:,.0f}")
 
         # Roster-context needs (focus on real needs, not surplus spam)
         def needs_summary(team, incoming_details):
@@ -491,7 +601,7 @@ with tab_trade:
                 incoming = inc_counts.get(p, 0)
                 if incoming > 0 and current < tgt:
                     if current == 0 and p == "QB":
-                        messages.append("really needs a starting QB, so that QB help matters a lot.")
+                        messages.append("really needs a starting QB, so QB help carries extra weight here.")
                     else:
                         messages.append(f"could use more {p}s, so adding {p} here fits a roster need.")
             return messages
@@ -517,31 +627,34 @@ with tab_trade:
 
         THRESH = 0.03
         if abs(pct) < THRESH:
-            msg = "This looks like a **fair trade** – both teams receive similar value by rankings."
+            msg = (
+                f"This looks like a **fair trade** – "
+                f"{teamA} and {teamB} receive very similar value by rankings."
+            )
             st.success(msg)
         elif pct > 0:
-            msg = f"**Trade favors Team A** by {diff:,.0f} (~{pct:.1%}). {grade(pct)}"
+            msg = f"**Trade favors {teamA}** by {diff:,.0f} (~{pct:.1%}). {grade(pct)}"
             if A_needs:
-                msg += " Team A " + " ".join(A_needs)
+                msg += " " + f"{teamA} " + " ".join(A_needs)
             if B_needs:
-                msg += " Team B " + " ".join(B_needs)
+                msg += " " + f"{teamB} " + " ".join(B_needs)
             st.info(msg)
         else:
-            msg = f"**Trade favors Team B** by {abs(diff):,.0f} (~{abs(pct):.1%}). {grade(pct)}"
+            msg = f"**Trade favors {teamB}** by {abs(diff):,.0f} (~{abs(pct):.1%}). {grade(pct)}"
             if B_needs:
-                msg += " Team B " + " ".join(B_needs)
+                msg += " " + f"{teamB} " + " ".join(B_needs)
             if A_needs:
-                msg += " Team A " + " ".join(A_needs)
+                msg += " " + f"{teamA} " + " ".join(A_needs)
             st.info(msg)
 
         with st.expander("Details (who adds what value)"):
-            st.write("**What Team A receives**")
+            st.write(f"**What {teamA} receives**")
             if len(A_get_p_det):
                 st.table(pd.DataFrame(A_get_p_det, columns=["Player", "Value", "Need Mult", "Pos"]))
             if len(A_get_pk_det):
                 st.table(pd.DataFrame(A_get_pk_det, columns=["Pick", "Value"]))
 
-            st.write("**What Team B receives**")
+            st.write(f"**What {teamB} receives**")
             if len(B_get_p_det):
                 st.table(pd.DataFrame(B_get_p_det, columns=["Player", "Value", "Need Mult", "Pos"]))
             if len(B_get_pk_det):
@@ -560,7 +673,7 @@ with tab_finder:
 
     target_list = roster_players(tf_to)
     tf_target = st.selectbox(
-        "Target player on partner's roster",
+        f"Target player on {tf_to}",
         target_list,
         format_func=lambda x: label_map.get(x, x),
     )
@@ -666,5 +779,5 @@ with tab_finder:
     else:
         for i, (assets, v) in enumerate(uniq[:5], start=1):
             pct = v / target_val if target_val > 0 else 0
-            st.write(f"**Suggestion {i}** — value to partner: {v:,.0f} (~{pct:.0%} of target)")
+            st.write(f"**Suggestion {i}** — value to {tf_to}: {v:,.0f} (~{pct:.0%} of target)")
             st.write("- " + "\n- ".join(assets))
