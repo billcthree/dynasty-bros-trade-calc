@@ -510,14 +510,38 @@ if players_df["ModelPoints"].isna().any():
     )
 
 max_pts = players_df["ModelPoints"].max()
+
 if max_pts <= 0:
+    # Fallback if something goes wrong with the PPR curves
     players_df["BaseValue"] = (
         ELITE_GAP * np.exp(-RANK_IMPORTANCE * (players_df["Rank"] - 1))
     ).round(2)
 else:
-    steep = 1.0 + (RANK_IMPORTANCE - 0.015) * 20.0
-    norm = (players_df["ModelPoints"] / max_pts).clip(lower=0.0001)
-    players_df["BaseValue"] = (ELITE_GAP * np.power(norm, steep)).round(2)
+    # 1) Start from relative PPR points
+    rel_pts = (players_df["ModelPoints"] / max_pts).clip(0.0001, 1.0)
+
+    # 2) Make the curve steeper so elites separate more from mid-tier
+    #    Bigger RANK_IMPORTANCE still makes the drop-off faster.
+    curve_power = 1.6 + (RANK_IMPORTANCE - 0.015) * 30.0
+    base_curve = np.power(rel_pts, curve_power)
+
+    # 3) Tier multiplier: top overall ranks get a little extra bump
+    #    This keeps guys like CeeDee / Waddle clearly above WR20–WR30 types.
+    overall_rank = players_df["Rank"].rank(method="first")
+
+    tier_mult = np.where(
+        overall_rank <= 12, 1.30,        # true elite tier
+        np.where(
+            overall_rank <= 24, 1.18,    # strong WR1 / RB1 / QB1 range
+            np.where(
+                overall_rank <= 48, 1.08,  # solid starters
+                1.00                       # everyone else
+            )
+        )
+    )
+
+    players_df["BaseValue"] = (ELITE_GAP * base_curve * tier_mult).round(2)
+
 
 ages_table = load_age_table()
 team_avg_age = {}
