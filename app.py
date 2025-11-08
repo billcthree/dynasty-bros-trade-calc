@@ -8,13 +8,18 @@ import requests
 
 # -------------------- Page config --------------------
 st.set_page_config(
-    page_title="Dynasty Bros. Trade Calculator (FantasyPros + Sleeper)",
+    page_title="Dynasty Bros. Trade Calculator",
     layout="wide"
 )
-st.title("Dynasty Bros. Trade Calculator (using FantasyPros Rankings + AI Generated Team Needs)")
-st.caption(
-    "FantasyPros dynasty ranks + live Sleeper rosters. "
-    "Rank-first values with light team-need seasoning. Picks scaled by roster strength, record, and original team."
+
+# Smaller, cleaner title
+st.markdown("## Dynasty Bros. Trade Calculator")
+st.caption("Superflex PPR trade calculator using FantasyPros rankings and live Sleeper rosters.")
+
+st.markdown(
+    "Using **FantasyPros Dynasty Superflex PPR** rankings as the baseline for player value "
+    "(latest list from FantasyPros: "
+    "[FantasyPros Dynasty SF PPR rankings](https://www.fantasypros.com/nfl/rankings/dynasty-superflex.php))."
 )
 
 # ====================================================
@@ -161,6 +166,43 @@ def load_sleeper_league_v2(league_id: str):
     return rosters_df, records_df, picks_by_team, pick_label_to_original_team, future_years
 
 
+@st.cache_data(show_spinner=False)
+def load_sleeper_logos(league_id: str):
+    """
+    Optional: league + team logos from Sleeper.
+    Returns (league_logo_url, {team_name: logo_url})
+    """
+    base = f"https://api.sleeper.app/v1/league/{league_id}"
+    league_info = requests.get(base, timeout=20).json()
+    users = requests.get(base + "/users", timeout=20).json()
+    rosts = requests.get(base + "/rosters", timeout=20).json()
+
+    league_logo = None
+    if league_info.get("avatar"):
+        league_logo = f"https://sleepercdn.com/avatars/{league_info['avatar']}"
+
+    # owner_id -> (team_name, avatar_url)
+    owner_to_team = {}
+    for i, u in enumerate(users):
+        meta = u.get("metadata") or {}
+        team_name = meta.get("team_name") or u.get("display_name") or f"Team {i+1}"
+        avatar_url = None
+        if u.get("avatar"):
+            avatar_url = f"https://sleepercdn.com/avatars/{u['avatar']}"
+        owner_to_team[u.get("user_id")] = (team_name, avatar_url)
+
+    team_logo = {}
+    for r in rosts:
+        owner_id = r.get("owner_id")
+        if owner_id not in owner_to_team:
+            continue
+        team_name, avatar_url = owner_to_team[owner_id]
+        if avatar_url:
+            team_logo[team_name] = avatar_url
+
+    return league_logo, team_logo
+
+
 # ====================================================
 # Sidebar: data source + modifiers
 # ====================================================
@@ -176,7 +218,7 @@ use_live = st.sidebar.checkbox(
 league_id = st.sidebar.text_input(
     "Sleeper League ID",
     value="1194681871141023744",
-    help="Paste your Sleeper league ID. Example: 1194681871141023744"
+    help="Paste your Sleeper league ID (from league settings in the Sleeper app)."
 )
 
 st.sidebar.caption("You can still upload CSVs below to override or test things manually.")
@@ -184,58 +226,61 @@ up_players = st.sidebar.file_uploader("Player Ranks CSV (Player, Pos, Rank)", ty
 up_rosters = st.sidebar.file_uploader("Rosters CSV (Team, Player, Pos optional)", type=["csv"])
 
 # -------- Modifiers ----------
-st.sidebar.header("2) Modifiers (quick dials)")
+st.sidebar.header("2) Player value tuning (optional)")
+st.sidebar.caption("If you're not sure what to do here, you can safely leave the defaults.")
 
 ELITE_GAP = st.sidebar.slider(
-    "Elite gap (value for Rank #1)",
+    "How valuable is the #1 overall player?",
     800.0, 2200.0, 1500.0, 50.0,
-    help="Higher = bigger gap between elite and everyone else."
+    help="Higher = bigger gap between elite players and everyone else."
 )
 
 RANK_IMPORTANCE = st.sidebar.slider(
-    "Rank importance (steepness)",
+    "How fast does value drop as rank gets worse?",
     0.015, 0.060, 0.038, 0.001,
-    help="Higher = rank differences matter more (e.g., #26 >> #137)."
+    help="Higher = rank differences matter more (e.g., Rank 26 >> Rank 137)."
 )
 
 NEED_WEIGHT = st.sidebar.slider(
-    "Roster needs weight",
+    "How much do roster needs matter?",
     0.0, 0.6, 0.20, 0.05,
-    help="How much roster needs nudge values. Keep low so rank is still the main driver."
+    help="Lower = mostly pure rankings. Higher = small boost when filling a thin position."
 )
 
 PACKAGE_PENALTY = st.sidebar.slider(
-    "2-for-1 tax (package penalty)",
+    "2-for-1 tax (multiple smaller players vs one stud)",
     0.0, 1.0, 0.75, 0.05,
-    help="Higher = quantity counts less vs quality. Prevents 3 mids beating 1 stud."
+    help="Higher = quantity counts less vs quality. Prevents 3 mid players from beating 1 superstar."
 )
 
-N_STRENGTH = st.sidebar.slider(
-    "Team strength depth (top N players)",
-    6, 20, 10, 1,
-    help="How many top assets define team strength for pick values."
-)
+st.sidebar.header("3) Advanced pick tuning (optional)")
+with st.sidebar.expander("Show pick value sliders"):
+    N_STRENGTH = st.sidebar.slider(
+        "Team strength depth (how many best players define team strength)",
+        6, 20, 10, 1,
+        help="Used to judge how strong a team is when valuing its future picks."
+    )
 
-PICK_MAX = st.sidebar.slider(
-    "Pick max (value for earliest 1st)",
-    250.0, 900.0, 500.0, 25.0,
-    help="Max value for the very earliest first-round pick."
-)
+    PICK_MAX = st.sidebar.slider(
+        "Pick max (value for earliest 1st-round pick)",
+        250.0, 900.0, 500.0, 25.0,
+        help="Upper limit for the very best first-round pick."
+    )
 
-PICK_SLOT_DECAY = st.sidebar.slider(
-    "In-round drop-off",
-    0.08, 0.35, 0.20, 0.01,
-    help="How fast picks get worse later in the round."
-)
+    PICK_SLOT_DECAY = st.sidebar.slider(
+        "How quickly picks lose value within a round",
+        0.08, 0.35, 0.20, 0.01,
+        help="Higher = early picks are much better than late picks in the same round."
+    )
 
-R2_SCALE = st.sidebar.slider("Round 2 scale vs Round 1", 0.20, 0.60, 0.40, 0.01)
-R3_SCALE = st.sidebar.slider("Round 3 scale vs Round 1", 0.08, 0.35, 0.20, 0.01)
-R4_SCALE = st.sidebar.slider("Round 4 scale vs Round 1", 0.03, 0.25, 0.10, 0.01)
+    R2_SCALE = st.sidebar.slider("Round 2 value vs Round 1", 0.20, 0.60, 0.40, 0.01)
+    R3_SCALE = st.sidebar.slider("Round 3 value vs Round 1", 0.08, 0.35, 0.20, 0.01)
+    R4_SCALE = st.sidebar.slider("Round 4 value vs Round 1", 0.03, 0.25, 0.10, 0.01)
 
-YEAR2_DISC = st.sidebar.slider("Next-year pick discount", 0.70, 0.95, 0.85, 0.01)
-YEAR3_DISC = st.sidebar.slider("Two-years-out discount", 0.50, 0.90, 0.70, 0.01)
+    YEAR2_DISC = st.sidebar.slider("Discount for next-year picks", 0.70, 0.95, 0.85, 0.01)
+    YEAR3_DISC = st.sidebar.slider("Discount for picks 2+ years out", 0.50, 0.90, 0.70, 0.01)
 
-st.sidebar.header("3) Update")
+st.sidebar.header("4) Update")
 manual = st.sidebar.checkbox("Manual mode (click button to recalc)", value=False)
 recalc = True
 if manual:
@@ -347,6 +392,18 @@ if not use_live:
                 pick_label_to_original[label] = tm
     for tm in picks_by_team:
         picks_by_team[tm] = sorted(picks_by_team[tm])
+
+# ---- Optional: logos ----
+league_logo = None
+team_logo_map = {}
+if use_live and league_id.strip():
+    try:
+        league_logo, team_logo_map = load_sleeper_logos(league_id.strip())
+    except Exception:
+        league_logo, team_logo_map = None, {}
+
+if league_logo:
+    st.image(league_logo, width=72)
 
 # ====================================================
 # Core valuation helpers (with positional scarcity)
@@ -503,11 +560,12 @@ def sum_players_value(player_list, team_for_need):
         if r.empty:
             continue
         pos = r["Pos"].iloc[0]
-        base = float(r["BaseValue"].iloc[0]) * float(r["PosMult"].iloc[0])
+        rank = int(r["Rank"].iloc[0])
+        base_before_need = float(r["BaseValue"].iloc[0]) * float(r["PosMult"].iloc[0])
         mult = apply_need(pos, counts)
-        val = base * mult
+        val = base_before_need * mult
         vals.append(val)
-        details.append((n, val, mult, pos))
+        details.append((n, pos, rank, base_before_need, mult, val))
     return package_sum(vals), details
 
 def sum_picks_value(pick_labels):
@@ -518,6 +576,57 @@ def sum_picks_value(pick_labels):
         vals.append(v)
         details.append((lbl, v))
     return package_sum(vals), details
+
+def counts_after_trade(team, send_players, receive_players):
+    counts = team_pos_counts(team).copy()
+    for n in send_players:
+        r = players_df.loc[players_df["Player"] == n]
+        if r.empty:
+            continue
+        pos = r["Pos"].iloc[0]
+        counts[pos] = counts.get(pos, 0) - 1
+    for n in receive_players:
+        r = players_df.loc[players_df["Player"] == n]
+        if r.empty:
+            continue
+        pos = r["Pos"].iloc[0]
+        counts[pos] = counts.get(pos, 0) + 1
+    for p in ["QB", "RB", "WR", "TE"]:
+        counts[p] = max(0, counts.get(p, 0))
+    return counts
+
+def needs_and_risk_summary(team, before_counts, after_counts, incoming_details):
+    notes = []
+    inc_counts = {"QB": 0, "RB": 0, "WR": 0, "TE": 0}
+    for _, pos, _, _, _, _ in incoming_details:
+        inc_counts[pos] = inc_counts.get(pos, 0) + 1
+
+    for pos in ["QB", "RB", "WR", "TE"]:
+        tgt = int(targets.get(pos, 0))
+        before = before_counts.get(pos, 0)
+        after = after_counts.get(pos, 0)
+        inc = inc_counts.get(pos, 0)
+
+        # Need being filled
+        if inc > 0 and before < tgt:
+            if before == 0 and pos == "QB":
+                notes.append(
+                    f"{team} badly needs a starting QB, so adding a QB here is especially valuable."
+                )
+            else:
+                notes.append(
+                    f"{team} could use more {pos}s (goes from {before} to {after} at {pos}), "
+                    f"so this trade helps their depth."
+                )
+
+        # Risk after the trade
+        if after < max(1, tgt) and before >= after:
+            notes.append(
+                f"After this trade, {team} would have {after} {pos}(s) "
+                f"(we usually aim for around {tgt}), so they might worry about {pos} depth."
+            )
+
+    return notes
 
 
 # ====================================================
@@ -530,14 +639,18 @@ tab_trade, tab_finder = st.tabs(["💼 Trade Calculator", "🔍 Trade Finder"])
 # TAB 1: TRADE CALCULATOR
 # ----------------------------------------------------
 with tab_trade:
-    st.subheader("Build a Trade (two boxes)")
+    st.subheader("Build a Trade")
 
     colA, colB = st.columns(2)
     with colA:
         teamA = st.selectbox("Team A (left side)", team_list, index=0 if team_list else None)
+        if teamA in team_logo_map:
+            st.image(team_logo_map[teamA], width=40)
     with colB:
         teamB_choices = [t for t in team_list if t != (teamA if team_list else None)]
         teamB = st.selectbox("Team B (right side)", teamB_choices, index=0 if teamB_choices else None)
+        if teamB in team_logo_map:
+            st.image(team_logo_map[teamB], width=40)
 
     a_players_list = roster_players(teamA) if teamA else []
     b_players_list = roster_players(teamB) if teamB else []
@@ -581,30 +694,17 @@ with tab_trade:
         B_get_total = B_get_players + B_get_picks
 
         m1, m2 = st.columns(2)
-        m1.metric(f"{teamA} receives (rank-first value)", f"{A_get_total:,.0f}")
-        m2.metric(f"{teamB} receives (rank-first value)", f"{B_get_total:,.0f}")
+        m1.metric(f"{teamA} receives (rank-based value)", f"{A_get_total:,.0f}")
+        m2.metric(f"{teamB} receives (rank-based value)", f"{B_get_total:,.0f}")
 
-        # Roster-context needs (focus on real needs, not surplus spam)
-        def needs_summary(team, incoming_details):
-            before = team_pos_counts(team)
-            inc_counts = {"QB": 0, "RB": 0, "WR": 0, "TE": 0}
-            for _, _, _, pos in incoming_details:
-                inc_counts[pos] = inc_counts.get(pos, 0) + 1
+        # Roster counts before/after for more transparent notes
+        countsA_before = team_pos_counts(teamA)
+        countsB_before = team_pos_counts(teamB)
+        countsA_after = counts_after_trade(teamA, a_send_players, b_send_players)
+        countsB_after = counts_after_trade(teamB, b_send_players, a_send_players)
 
-            messages = []
-            for p in ["QB", "RB", "WR", "TE"]:
-                tgt = int(targets.get(p, 0))
-                current = before.get(p, 0)
-                incoming = inc_counts.get(p, 0)
-                if incoming > 0 and current < tgt:
-                    if current == 0 and p == "QB":
-                        messages.append("really needs a starting QB, so QB help carries extra weight here.")
-                    else:
-                        messages.append(f"could use more {p}s, so adding {p} here fits a roster need.")
-            return messages
-
-        A_needs = needs_summary(teamA, A_get_p_det)
-        B_needs = needs_summary(teamB, B_get_p_det)
+        A_notes = needs_and_risk_summary(teamA, countsA_before, countsA_after, A_get_p_det)
+        B_notes = needs_and_risk_summary(teamB, countsB_before, countsB_after, B_get_p_det)
 
         st.markdown("---")
         st.subheader("Fairness Verdict")
@@ -616,45 +716,73 @@ with tab_trade:
         def grade(pct_diff: float) -> str:
             ad = abs(pct_diff)
             if ad < 0.05:
-                return "Fair for both sides."
+                return "Overall this looks fair for both sides."
             elif ad < 0.12:
-                return "Slight edge to the winner."
+                return "One side has a small edge, but it’s still reasonable."
             else:
-                return "Clear win for the winner."
+                return "This is a clear win for the side getting more value."
 
         THRESH = 0.03
         if abs(pct) < THRESH:
             msg = (
-                f"This looks like a **fair trade** – "
-                f"{teamA} and {teamB} receive very similar value by rankings."
+                f"Based on FantasyPros rankings, this looks like a **fair trade** – "
+                f"{teamA} and {teamB} receive very similar value. "
+                f"{grade(pct)}"
             )
             st.success(msg)
         elif pct > 0:
-            msg = f"**Trade favors {teamA}** by {diff:,.0f} (~{pct:.1%}). {grade(pct)}"
-            if A_needs:
-                msg += " " + f"{teamA} " + " ".join(A_needs)
-            if B_needs:
-                msg += " " + f"{teamB} " + " ".join(B_needs)
+            msg = (
+                f"**Trade favors {teamA}** by {diff:,.0f} (~{pct:.1%}). "
+                f"{grade(pct)}"
+            )
             st.info(msg)
         else:
-            msg = f"**Trade favors {teamB}** by {abs(diff):,.0f} (~{abs(pct):.1%}). {grade(pct)}"
-            if B_needs:
-                msg += " " + f"{teamB} " + " ".join(B_needs)
-            if A_needs:
-                msg += " " + f"{teamA} " + " ".join(A_needs)
+            msg = (
+                f"**Trade favors {teamB}** by {abs(diff):,.0f} (~{abs(pct):.1%}). "
+                f"{grade(pct)}"
+            )
             st.info(msg)
 
-        with st.expander("Details (who adds what value)"):
-            st.write(f"**What {teamA} receives**")
-            if len(A_get_p_det):
-                st.table(pd.DataFrame(A_get_p_det, columns=["Player", "Value", "Need Mult", "Pos"]))
-            if len(A_get_pk_det):
+        # Extra context: why a manager might like or hate it
+        st.markdown("##### Roster context (why someone might like or dislike this trade)")
+        if A_notes:
+            st.write(f"**For {teamA}:**")
+            for n in A_notes[:3]:
+                st.write("- " + n)
+        if B_notes:
+            st.write(f"**For {teamB}:**")
+            for n in B_notes[:3]:
+                st.write("- " + n)
+        if not (A_notes or B_notes):
+            st.caption(
+                "Neither team has obvious positional red flags in this deal. "
+                "At that point, it often comes down to personal preference, age windows, "
+                "and risk tolerance."
+            )
+
+        # Show key pieces w/ FantasyPros rank
+        def key_pieces(details):
+            if not details:
+                return []
+            df = pd.DataFrame(details, columns=["Player", "Pos", "FP Rank", "Base Value", "Need Mult", "Final Value"])
+            df = df.sort_values("Final Value", ascending=False)
+            return df.head(5)
+
+        with st.expander("See why: player ranks and values used"):
+            st.write(f"**What {teamA} receives (players)** — including FantasyPros Superflex PPR ranks")
+            dfA = key_pieces(A_get_p_det)
+            if not dfA.empty:
+                st.table(dfA)
+            if A_get_pk_det:
+                st.write(f"**Picks to {teamA}**")
                 st.table(pd.DataFrame(A_get_pk_det, columns=["Pick", "Value"]))
 
-            st.write(f"**What {teamB} receives**")
-            if len(B_get_p_det):
-                st.table(pd.DataFrame(B_get_p_det, columns=["Player", "Value", "Need Mult", "Pos"]))
-            if len(B_get_pk_det):
+            st.write(f"**What {teamB} receives (players)** — including FantasyPros Superflex PPR ranks")
+            dfB = key_pieces(B_get_p_det)
+            if not dfB.empty:
+                st.table(dfB)
+            if B_get_pk_det:
+                st.write(f"**Picks to {teamB}**")
                 st.table(pd.DataFrame(B_get_pk_det, columns=["Pick", "Value"]))
 
 
@@ -665,8 +793,12 @@ with tab_finder:
     st.subheader("Trade Finder — suggest packages for a target")
 
     tf_from = st.selectbox("Your team (offering)", team_list, key="tf_from")
+    if tf_from in team_logo_map:
+        st.image(team_logo_map[tf_from], width=40)
     tf_to_choices = [t for t in team_list if t != tf_from]
     tf_to = st.selectbox("Trade partner", tf_to_choices, key="tf_to")
+    if tf_to in team_logo_map:
+        st.image(team_logo_map[tf_to], width=40)
 
     target_list = roster_players(tf_to)
     tf_target = st.selectbox(
@@ -678,24 +810,25 @@ with tab_finder:
     def player_value_for_team(player_name, team_for_need):
         r = players_df.loc[players_df["Player"] == player_name]
         if r.empty:
-            return 0.0, 1.0
+            return 0.0, 1.0, None
         pos = r["Pos"].iloc[0]
+        rank = int(r["Rank"].iloc[0])
         base = float(r["BaseValue"].iloc[0]) * float(r["PosMult"].iloc[0])
         mult = apply_need(pos, team_pos_counts(team_for_need))
-        return base * mult, mult
+        return base * mult, mult, rank
 
-    target_val, target_mult = player_value_for_team(tf_target, tf_to)
+    target_val, target_mult, target_rank = player_value_for_team(tf_target, tf_to)
     st.caption(
         f"Estimated value of {label_map.get(tf_target, tf_target)} **to {tf_to}**: "
-        f"~{target_val:,.0f} (need multiplier: {target_mult:.2f}). "
-        "Aim for ~90–110% of this in offers."
+        f"~{target_val:,.0f} (FantasyPros Rank {target_rank}, need multiplier: {target_mult:.2f}). "
+        "Aim for roughly 90–110% of this value in offers."
     )
 
     your_names = roster_players(tf_from)
     cand = players_df[players_df["Player"].isin(your_names)].copy()
 
     def val_to_partner(name):
-        v, _ = player_value_for_team(name, tf_to)
+        v, _, _ = player_value_for_team(name, tf_to)
         return v
 
     from_counts = team_pos_counts(tf_from)
@@ -778,3 +911,34 @@ with tab_finder:
             pct = v / target_val if target_val > 0 else 0
             st.write(f"**Suggestion {i}** — value to {tf_to}: {v:,.0f} (~{pct:.0%} of target)")
             st.write("- " + "\n- ".join(assets))
+
+# ----------------------------------------------------
+# Explainer / assumptions
+# ----------------------------------------------------
+with st.expander("How this calculator works & assumptions"):
+    st.markdown(
+        """
+- **Player values** start from FantasyPros **Dynasty Superflex PPR** ranks  
+  (lower rank number = better player). We turn rank into a value curve, so
+  Rank 10 is much more valuable than Rank 110.
+- **Position value** is adjusted two ways:
+  - A small fixed bump (QB a bit higher, TE a bit lower by default).
+  - A **scarcity tweak**: if there are very few top QBs / TEs, they get a little extra
+    weight vs positions with tons of solid options.
+- **Roster needs**: if a team is light at a position (e.g. only one QB), incoming
+  players at that position get a small boost. This is intentionally a light touch –
+  rankings still matter much more than depth.
+- **Package penalty**: multiple mid-range players don't fully equal one elite player.
+  A 2-for-1 tax is applied so the stud usually wins.
+- **Future picks**:
+  - Ownership and which years/rounds each team has are pulled from Sleeper,
+    including traded picks.
+  - A pick's value depends on the **original team's** record and roster strength,
+    not who owns it now. Bad teams' future 1sts are worth a lot.
+  - Further-out picks are discounted a bit (you can adjust this in the sidebar).
+- **Fairness** is a guideline, not a rule:
+  - The app tells you who “wins” *by the numbers*.
+  - The roster notes explain why a real manager might still accept or reject
+    a deal (QB depth, RB youth, competing vs rebuilding, etc.).
+"""
+    )
