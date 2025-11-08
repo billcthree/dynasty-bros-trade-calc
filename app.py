@@ -42,10 +42,79 @@ def load_fantasypros_rankings() -> pd.DataFrame:
     """
     Scrape FantasyPros dynasty overall ranks and return:
     columns: Player, Pos, Rank
+
+    We fetch the HTML ourselves with a browser-like User-Agent, then
+    let pandas.read_html parse the first table.
     """
     url = "https://www.fantasypros.com/nfl/rankings/dynasty-overall.php"
-    tables = pd.read_html(url)
+
+    # Fetch the page with a friendly User-Agent so the site doesn't block us
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0 Safari/537.36"
+        )
+    }
+    resp = requests.get(url, headers=headers, timeout=20)
+    resp.raise_for_status()
+    html = resp.text
+
+    # Parse tables from the HTML text
+    tables = pd.read_html(html)
+    if not tables:
+        raise ValueError("No tables found in FantasyPros page")
+
     df = tables[0]
+
+    # Try to find rank & player columns generically
+    rank_col = None
+    for c in df.columns:
+        if "Rank" in str(c) or "#" in str(c):
+            rank_col = c
+            break
+    if rank_col is None:
+        rank_col = df.columns[0]
+
+    player_col = None
+    for c in df.columns:
+        if "Player" in str(c):
+            player_col = c
+            break
+    if player_col is None:
+        player_col = df.columns[1]
+
+    slim = df[[rank_col, player_col]].copy()
+    slim.columns = ["Rank", "PlayerRaw"]
+
+    # Parse "PlayerRaw" -> Player, Pos
+    def parse_player(raw):
+        s = str(raw).strip()
+        toks = s.split()
+        if len(toks) >= 3:
+            pos = toks[-1]
+            # team = toks[-2]  # not used
+            name = " ".join(toks[:-2])
+        elif len(toks) >= 2:
+            pos = toks[-1]
+            name = " ".join(toks[:-1])
+        else:
+            pos = ""
+            name = s
+        return pd.Series({"Player": name, "Pos": pos})
+
+    parsed = slim["PlayerRaw"].apply(parse_player)
+    out = pd.concat([slim["Rank"], parsed], axis=1)
+    out["Rank"] = pd.to_numeric(out["Rank"], errors="coerce")
+    out = out.dropna(subset=["Rank"]).reset_index(drop=True)
+    out["Pos"] = out["Pos"].str.upper().str.strip()
+    out = out[out["Pos"].isin(["QB", "RB", "WR", "TE"])]
+    out["Norm"] = out["Player"].apply(normalize_name)
+
+    # If duplicates after normalization, keep the best (lowest rank)
+    out = out.sort_values("Rank").drop_duplicates("Norm", keep="first").reset_index(drop=True)
+    return out
+
 
     # Try to find rank & player columns generically
     rank_col = None
