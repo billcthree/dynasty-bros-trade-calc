@@ -114,9 +114,6 @@ def load_sleeper_league_v2(league_id: str):
     )
 
     # ---------- Build future pick ownership ----------
-    # Base assumption: each roster keeps its own picks (future_years x draft_rounds),
-    # then apply /traded_picks for final ownership.
-
     picks_current_owner = {}  # (year, round, original_roster_id) -> current_owner_team
 
     # Initial ownership = original owner
@@ -171,6 +168,8 @@ def load_sleeper_logos(league_id: str):
     """
     Optional: league + team logos from Sleeper.
     Returns (league_logo_url, {team_name: logo_url})
+
+    We try team avatars first (league-specific), then fall back to user avatars.
     """
     base = f"https://api.sleeper.app/v1/league/{league_id}"
     league_info = requests.get(base, timeout=20).json()
@@ -186,8 +185,7 @@ def load_sleeper_logos(league_id: str):
     for i, u in enumerate(users):
         meta = u.get("metadata") or {}
         team_name = meta.get("team_name") or u.get("display_name") or f"Team {i+1}"
-        # Prefer team-specific avatar if present, otherwise fallback to user avatar
-        avatar_id = meta.get("team_avatar") or meta.get("avatar") or u.get("avatar")
+        avatar_id = meta.get("team_avatar") or u.get("avatar")
         avatar_url = f"https://sleepercdn.com/avatars/{avatar_id}" if avatar_id else None
         owner_to_team[u.get("user_id")] = (team_name, avatar_url)
 
@@ -239,6 +237,31 @@ def load_ppr_curves():
             curves[pos] = tmp.reset_index(drop=True)
 
     return curves if curves else None
+
+
+@st.cache_data(show_spinner=False)
+def load_age_table():
+    """
+    Load player ages from data/fantasyage.csv (Player, Age).
+    Used only for small adjustments to pick values (older teams' picks
+    are a bit more valuable, very young cores slightly less).
+    """
+    try:
+        df = pd.read_csv("data/fantasyage.csv")
+    except Exception:
+        return None
+
+    cols = [c.lower() for c in df.columns]
+    df.columns = cols
+    if "player" not in cols or ("age" not in cols and "yrs" not in cols):
+        return None
+
+    age_col = "age" if "age" in cols else "yrs"
+    out = df[["player", age_col]].rename(columns={"player": "Player", age_col: "Age"})
+    out["Age"] = pd.to_numeric(out["Age"], errors="coerce")
+    out = out.dropna(subset=["Age"])
+    out["Norm"] = out["Player"].apply(normalize_name)
+    return out
 
 
 # ====================================================
@@ -357,7 +380,7 @@ if use_live and league_id.strip():
         roster_enriched = rosters_live.copy()
         roster_enriched["Norm"] = roster_enriched["Player"].apply(normalize_name)
         roster_enriched = roster_enriched.merge(
-            fp2[["Norm", "Rank", "Pos"]].rename(columns={"Pos": "FP_Pos"}),
+            fp2[["Norm", "Rank", "Pos"]].rename(columns={"Pos": "FP_Pos"]),
             on="Norm",
             how="left",
         )
@@ -473,7 +496,11 @@ for pos in ["QB", "RB", "WR", "TE"]:
 posmult_effective = {}
 for pos in ["QB", "RB", "WR", "TE"]:
     base_mult = DEFAULT_POSMULT.get(pos, 1.0)
-    posmult_effective[pos] = base_mult * scarcity_mult.get(pos, 1.0)
+    eff = base_mult * scarcity_mult.get(pos, 1.0)
+    # TE should almost never jump above WR/RB just because it is scarce.
+    if pos == "TE":
+        eff = min(eff, 0.95)  # cap TE so stud WRs like Lamb aren't passed by mid TEs
+    posmult_effective[pos] = eff
 
 players_df["PosMult"] = players_df["Pos"].map(posmult_effective).fillna(1.0)
 
@@ -498,25 +525,38 @@ players_df["ModelPoints"] = players_df.apply(estimate_points, axis=1)
 # Fallback if curves missing or partial
 if players_df["ModelPoints"].isna().any():
     fallback_idx = players_df["ModelPoints"].isna()
-    max_rank = players_df["Rank"].max()
-    # simple fallback: higher FP rank -> more "points"
+    max_rank_tmp = players_df["Rank"].max()
     players_df.loc[fallback_idx, "ModelPoints"] = (
-        max_rank - players_df.loc[fallback_idx, "Rank"] + 1
+        max_rank_tmp - players_df.loc[fallback_idx, "Rank"] + 1
     )
 
 max_pts = players_df["ModelPoints"].max()
 if max_pts <= 0:
-    # Hard fallback: old exponential by overall rank
     players_df["BaseValue"] = (
         ELITE_GAP * np.exp(-RANK_IMPORTANCE * (players_df["Rank"] - 1))
     ).round(2)
 else:
-    # Steepness derived from RANK_IMPORTANCE slider
-    # 0.015 -> ~1.0; 0.060 -> ~1.9
+    # steepness based on RANK_IMPORTANCE slider
     steep = 1.0 + (RANK_IMPORTANCE - 0.015) * 20.0
-    norm = players_df["ModelPoints"] / max_pts
-    norm = norm.clip(lower=0.0001)  # avoid zero
+    norm = (players_df["ModelPoints"] / max_pts).clip(lower=0.0001)
     players_df["BaseValue"] = (ELITE_GAP * np.power(norm, steep)).round(2)
+
+# --- age table for pick context ---
+ages_table = load_age_table()
+team_avg_age = {}
+league_avg_age = None
+if ages_table is not None:
+    ages_norm = ages_table.copy()
+    ages_norm["Norm"] = ages_norm["Norm"].astype(str)
+    roster_with_norm = rosters_df.copy()
+    roster_with_norm["Norm"] = roster_with_norm["Player"].apply(normalize_name)
+    roster_with_norm = roster_with_norm.merge(
+        ages_norm[["Norm", "Age"]], on="Norm", how="left"
+    )
+    grp = roster_with_norm.groupby("Team")["Age"].mean()
+    team_avg_age = grp.to_dict()
+    if len(team_avg_age):
+        league_avg_age = float(np.nanmean(list(team_avg_age.values())))
 
 def team_pos_counts(team: str):
     names = set(rosters_df.loc[rosters_df["Team"] == team, "Player"].tolist())
@@ -536,7 +576,7 @@ def need_multiplier(count, target):
     return 0.93
 
 def apply_need(pos, team_counts):
-    base_mult = need_multiplier(team_counts.get(pos, 0), targets.get(pos, 0))
+    base_mult = need_multiplier(team_counts.get(pos, 0), DEFAULT_TARGETS.get(pos, 0))
     # Blend toward 1 based on NEED_WEIGHT so needs are a light factor
     return 1.0 + NEED_WEIGHT * (base_mult - 1.0)
 
@@ -575,6 +615,12 @@ sorted_for_picks = sorted(
 )
 team_pick_slot = {t: i + 1 for i, t in enumerate(sorted_for_picks)}
 
+# Count how many future picks each ORIGINAL team has (for slight inventory adjustment)
+original_pick_counts = {}
+for lbl, orig in pick_label_to_original.items():
+    original_pick_counts[orig] = original_pick_counts.get(orig, 0) + 1
+avg_num_picks = float(np.mean(list(original_pick_counts.values()))) if original_pick_counts else 0.0
+
 def pick_factor_for_round(rnd: int) -> float:
     return {1: 1.0, 2: R2_SCALE, 3: R3_SCALE, 4: R4_SCALE}.get(rnd, 0.0)
 
@@ -586,22 +632,43 @@ def pick_base_value(slot: int, rnd: int) -> float:
     return PICK_MAX * round_mult * slot_val
 
 def pick_value(original_team: str, year: int, rnd: int) -> float:
+    """
+    Base on:
+      - projected slot (record + roster strength)
+      - round
+      - how far in the future (year discount)
+      - small adjustment for age of original roster
+      - small adjustment for how many picks the original team already owns
+    """
     current_year = datetime.now().year
-    diff = year - current_year
-    if diff <= 0:
+    diff_years = year - current_year
+    if diff_years <= 0:
         year_mult = 1.0
-    elif diff == 1:
+    elif diff_years == 1:
         year_mult = YEAR2_DISC
     else:
-        year_mult = YEAR3_DISC ** diff
+        year_mult = YEAR3_DISC ** diff_years
 
     slot = team_pick_slot.get(original_team, len(team_list))
     base = pick_base_value(slot, rnd)
-    return round(base * year_mult, 1)
+
+    # Age factor: older core -> picks a bit more valuable, very young core -> a bit less
+    age_mult = 1.0
+    if league_avg_age and original_team in team_avg_age:
+        delta_age = team_avg_age[original_team] - league_avg_age  # years
+        delta_age = max(-3.0, min(3.0, delta_age))
+        age_mult = 1.0 + 0.02 * delta_age  # +/-6% max
+
+    # Inventory factor: team with very few picks gets a tiny bump for each pick
+    inv_mult = 1.0
+    if avg_num_picks > 0 and original_team in original_pick_counts:
+        delta_picks = avg_num_picks - original_pick_counts[original_team]
+        delta_picks = max(-3.0, min(3.0, delta_picks))
+        inv_mult = 1.0 + 0.01 * delta_picks  # +/-3% max
+
+    return round(base * year_mult * age_mult * inv_mult, 1)
 
 def build_pick_labels_for_team(team: str):
-    # In live mode, this uses picks_by_team (includes trades, only future drafts).
-    # In CSV mode, picks_by_team was built generically above.
     return picks_by_team.get(team, [])
 
 def parse_pick_label(label: str):
@@ -609,7 +676,6 @@ def parse_pick_label(label: str):
         parts = label.split()
         yr = int(parts[0])
         rnd = int(parts[1].replace("R", ""))
-        # team in parentheses is ORIGINAL team (whose record/strength matters)
         original_team = label[label.find("(") + 1:label.find(")")]
         return yr, rnd, original_team
     except Exception:
@@ -687,7 +753,6 @@ def needs_and_risk_summary(team, before_counts, after_counts, incoming_details):
         after = after_counts.get(pos, 0)
         inc = inc_counts.get(pos, 0)
 
-        # Need being filled
         if inc > 0 and before < tgt:
             if before == 0 and pos == "QB":
                 notes.append(
@@ -700,7 +765,6 @@ def needs_and_risk_summary(team, before_counts, after_counts, incoming_details):
                     f"so this trade helps their depth."
                 )
 
-        # Risk after the trade
         if after < max(1, tgt) and before >= after:
             notes.append(
                 f"After this trade, {team} would have {after} {pos}(s) "
@@ -708,6 +772,55 @@ def needs_and_risk_summary(team, before_counts, after_counts, incoming_details):
             )
 
     return notes
+
+def pick_summary(pick_details):
+    if not pick_details:
+        return "No picks involved for this side."
+    total = sum(v for _, v in pick_details)
+    firsts = [lbl for lbl, _ in pick_details if " R1 " in lbl]
+    others = [lbl for lbl, _ in pick_details if " R1 " not in lbl]
+    parts = []
+    if firsts:
+        parts.append(f"{len(firsts)} first-round pick(s)")
+    if others:
+        parts.append(f"{len(others)} later-round pick(s)")
+    return f"Receiving {', '.join(parts)} worth about {total:,.0f} value points."
+
+def suggest_trade_balance(team_favored, team_behind, gap, favored_send_players, favored_send_picks):
+    """
+    Suggest one asset the favored side could add to bring things closer.
+    Prefers picks, then small depth players.
+    """
+    if gap < 50:
+        return None
+
+    # candidate picks
+    candidates = []
+    for lbl in build_pick_labels_for_team(team_favored):
+        if lbl in favored_send_picks:
+            continue
+        v = label_value(lbl)
+        if v <= 0:
+            continue
+        candidates.append(("pick", lbl, v))
+
+    # candidate depth players
+    for p in roster_players(team_favored):
+        if p in favored_send_players:
+            continue
+        v, det = sum_players_value([p], team_behind)
+        if v <= 0:
+            continue
+        candidates.append(("player", p, v))
+
+    if not candidates:
+        return None
+
+    best = None
+    for kind, name, v in candidates:
+        if best is None or abs(v - gap) < abs(best[2] - gap):
+            best = (kind, name, v)
+    return best
 
 
 # ====================================================
@@ -801,7 +914,6 @@ with tab_trade:
                 pct = diff / larger
 
                 def grade(pct_diff: float) -> str:
-                    """Soft language explanation of how lopsided things look."""
                     ad = abs(pct_diff)
                     if ad < 0.05:
                         return "The numbers here are very close, so both sides could reasonably feel okay about it."
@@ -810,7 +922,6 @@ with tab_trade:
                     else:
                         return "One side is getting a noticeable edge on pure value; the other side would likely need strong non-numbers reasons (team fit, age profile, risk) to accept."
 
-                # Which team the model slightly favors
                 if abs(pct) < 0.03:
                     headline = (
                         f"By the model, this trade is roughly **even**. "
@@ -851,12 +962,58 @@ with tab_trade:
                 A_summary = summarize_side(A_get_p_det)
                 B_summary = summarize_side(B_get_p_det)
 
-                if A_summary or B_summary:
+                if A_summary or B_summary or A_get_pk_det or B_get_pk_det:
                     st.markdown("**Biggest pieces each side is getting (by this model):**")
                     if A_summary:
                         st.markdown(f"- {teamA} is mainly gaining: {A_summary}.")
+                    if A_get_pk_det:
+                        st.markdown(f"- For {teamA}, picks add: {pick_summary(A_get_pk_det)}")
                     if B_summary:
                         st.markdown(f"- {teamB} is mainly gaining: {B_summary}.")
+                    if B_get_pk_det:
+                        st.markdown(f"- For {teamB}, picks add: {pick_summary(B_get_pk_det)}")
+
+                # How to even it out
+                st.markdown("### How to even this trade out")
+
+                favored_team = None
+                gap = abs(diff)
+                if abs(pct) < 0.03 or gap < 50:
+                    st.write(
+                        "This already looks fairly close. If managers want it perfectly even, "
+                        "they could consider a small late-round pick swap or adding a minor depth piece."
+                    )
+                else:
+                    if diff > 0:
+                        favored_team = teamA
+                        behind_team = teamB
+                        suggestion = suggest_trade_balance(teamA, teamB, gap, a_send_players, a_send_picks)
+                    else:
+                        favored_team = teamB
+                        behind_team = teamA
+                        suggestion = suggest_trade_balance(teamB, teamA, gap, b_send_players, b_send_picks)
+
+                    if suggestion is None:
+                        st.write(
+                            f"The model sees a noticeable gap, but couldn't find a clean single asset "
+                            f"from {favored_team} that closely matches the difference. "
+                            "Consider combining a smaller player with a mid/late pick."
+                        )
+                    else:
+                        kind, name, v = suggestion
+                        new_gap = abs(gap - v)
+                        if kind == "pick":
+                            st.write(
+                                f"To bring things closer, **{favored_team}** could add pick **{name}** "
+                                f"(worth ~{v:,.0f} value points) going to **{behind_team}**. "
+                                f"That would shrink the gap from about {gap:,.0f} down to roughly {new_gap:,.0f}."
+                            )
+                        else:
+                            st.write(
+                                f"To bring things closer, **{favored_team}** could add depth player **{label_map.get(name, name)}** "
+                                f"(worth ~{v:,.0f} value points) going to **{behind_team}**. "
+                                f"That would shrink the gap from about {gap:,.0f} down to roughly {new_gap:,.0f}."
+                            )
 
                 # Extra context: why a manager might like or hate it
                 st.markdown("### Roster context — why managers might feel differently")
@@ -924,14 +1081,11 @@ with tab_finder:
     )
 
     def player_value_for_team(player_name, team_for_need):
-        r = players_df.loc[players_df["Player"] == player_name]
-        if r.empty:
+        v, det = sum_players_value([player_name], team_for_need)
+        if not det:
             return 0.0, 1.0, None
-        pos = r["Pos"].iloc[0]
-        rank = int(r["Rank"].iloc[0])
-        base = float(r["BaseValue"].iloc[0]) * float(r["PosMult"].iloc[0])
-        mult = apply_need(pos, team_pos_counts(team_for_need))
-        return base * mult, mult, rank
+        _, pos, rank, base_val, mult, _ = det[0]
+        return v, mult, rank
 
     target_val, target_mult, target_rank = player_value_for_team(tf_target, tf_to)
     st.caption(
@@ -1049,7 +1203,8 @@ with st.expander("How this calculator works & assumptions"):
 - **Position value** is adjusted two ways:
   - A small fixed bump (QB a bit higher, TE a bit lower by default).
   - A **scarcity tweak**: if there are very few top QBs / TEs, they get a little extra
-    weight vs positions with tons of solid options.
+    weight vs positions with tons of solid options – but TE is capped so it
+    doesn’t jump past elite WR/RB purely on scarcity.
 - **Roster needs**: if a team is light at a position (e.g. only one QB), incoming
   players at that position get a small boost. This is intentionally a light touch –
   rankings and the PPR curves still matter much more than depth.
@@ -1058,12 +1213,15 @@ with st.expander("How this calculator works & assumptions"):
 - **Future picks**:
   - Ownership and which years/rounds each team has are pulled from Sleeper,
     including traded picks.
-  - A pick's value depends on the **original team's** record and roster strength,
-    not who owns it now. Bad teams' future 1sts are worth a lot.
+  - A pick's baseline value depends on the **original team's** record and roster strength
+    (bad teams' future 1sts are projected earlier and worth more).
+  - We then apply very small nudges based on:
+      - How old the original team’s core is (older rosters → picks a bit more valuable).
+      - How many future picks they already have (fewer picks → each one a bit more valuable).
   - Further-out picks are discounted a bit (you can adjust this in the sidebar).
 - **Fairness** is a guideline, not a rule:
   - The app tells you which side it thinks is getting more value *by the numbers*.
-  - The roster notes explain why a real manager might still accept or reject
+  - The roster and pick notes explain why a real manager might still accept or reject
     a deal (QB depth, RB youth, competing vs rebuilding, etc.).
   - Upside, injuries, personal player takes, and league-specific quirks will
     always matter too.
