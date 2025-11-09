@@ -348,12 +348,11 @@ if manual:
 DEFAULT_TARGETS = {"QB": 2, "RB": 4, "WR": 5, "TE": 2}
 DEFAULT_POSMULT = {"QB": 1.10, "RB": 1.00, "WR": 1.00, "TE": 0.95}
 
-# These will be filled depending on mode
 picks_by_team = {}
 pick_label_to_original = {}
 future_pick_years = []
 
-# ---- Live mode: Sleeper + local FantasyPros CSV ----
+# ---- Live mode ----
 if use_live and league_id.strip():
     try:
         with st.spinner("Loading Sleeper league data + local FantasyPros rankings..."):
@@ -400,7 +399,7 @@ if use_live and league_id.strip():
 else:
     use_live = False
 
-# ---- Non-live mode: CSV uploads only ----
+# ---- Offline mode ----
 if not use_live:
     base_players = pd.DataFrame(columns=["Player", "Pos", "Rank"])
     base_rosters = pd.DataFrame(columns=["Team", "Player"])
@@ -446,7 +445,7 @@ if not use_live:
     for tm in picks_by_team:
         picks_by_team[tm] = sorted(picks_by_team[tm])
 
-# ---- Optional: logos ----
+# Logos
 league_logo = None
 team_logo_map = {}
 if use_live and league_id.strip():
@@ -459,7 +458,7 @@ if league_logo:
     st.image(league_logo, width=72)
 
 # ====================================================
-# Core valuation helpers (with PPR curves, age, risk)
+# Core valuation logic (PPR curves, age, risk)
 # ====================================================
 
 players_df = players_df.copy()
@@ -469,7 +468,6 @@ players_df = players_df.dropna(subset=["Rank"]).reset_index(drop=True)
 players_df["Pos"] = players_df["Pos"].astype(str).str.upper().str.strip()
 players_df["PosRank"] = players_df.groupby("Pos")["Rank"].rank(method="first")
 
-# Positional scarcity based on how many top-100 players each position has
 TOP_CUTOFF = 100
 top_slice = players_df[players_df["Rank"] <= TOP_CUTOFF]
 counts = top_slice["Pos"].value_counts()
@@ -488,16 +486,14 @@ for pos in ["QB", "RB", "WR", "TE"]:
     base_mult = DEFAULT_POSMULT.get(pos, 1.0)
     eff = base_mult * scarcity_mult.get(pos, 1.0)
     if pos == "TE":
-        eff = min(eff, 0.95)  # cap TE so it doesn't beat elite WR/RB just for scarcity
+        eff = min(eff, 0.95)
     posmult_effective[pos] = eff
 
 players_df["PosMult"] = players_df["Pos"].map(posmult_effective).fillna(1.0)
 
-# Load curves and ages
 ppr_curves = load_ppr_curves()
 ages_table = load_age_table()
 
-# Attach age to players_df (if available)
 players_df["Norm"] = players_df["Player"].apply(normalize_name)
 if ages_table is not None:
     ages_merge = ages_table[["Norm", "Age"]].copy()
@@ -505,7 +501,6 @@ if ages_table is not None:
 else:
     players_df["Age"] = np.nan
 
-# Age config per position: (peak_age, decline_start, floor_mult, young_boost_max)
 AGE_CFG = {
     "QB": (27, 33, 0.80, 0.06),
     "RB": (24, 27, 0.55, 0.10),
@@ -521,19 +516,13 @@ def age_mult_for_player(pos, age):
         pos, (26, 30, 0.7, 0.06)
     )
     age = float(age)
-
-    # Younger than peak: small bonus max young_boost
     if age <= peak:
-        span = 6.0  # how many years below peak still get boosted
+        span = 6.0
         factor = (peak - age) / span
         factor = max(0.0, min(1.0, factor))
         return 1.0 + young_boost * factor
-
-    # Between peak and start of decline: neutral
     if age <= decline_start:
         return 1.0
-
-    # After decline: gradual drop until floor_mult
     years_over = age - decline_start
     decline_span = 6.0
     per_year = (1.0 - floor_mult) / decline_span
@@ -541,24 +530,13 @@ def age_mult_for_player(pos, age):
     return max(floor_mult, mult)
 
 def risk_mult_for_player(pos, age):
-    """
-    Risk slider:
-      - If RISK_PREF > 0.5 => favor younger upside.
-      - If RISK_PREF < 0.5 => favor safer vets a bit more.
-    Effect is intentionally small (~±10% max).
-    """
     if pd.isna(age):
         return 1.0
     pos = str(pos).upper()
     peak, _, _, _ = AGE_CFG.get(pos, (26, 30, 0.7, 0.06))
     age = float(age)
-
-    # youth_score in [-1, 1]: positive = younger than peak, negative = older
     youth_score = (peak - age) / 8.0
     youth_score = max(-1.0, min(1.0, youth_score))
-
-    # If RISK_PREF=0.5 => effect is zero.
-    # At the extremes, max ±10% tilt.
     factor = 1.0 + (RISK_PREF - 0.5) * 0.2 * youth_score
     return float(max(0.9, min(1.1, factor)))
 
@@ -587,21 +565,14 @@ if players_df["ModelPoints"].isna().any():
 max_pts = players_df["ModelPoints"].max()
 
 if max_pts <= 0:
-    # Fallback if something goes wrong with the PPR curves
     players_df["BaseValueRaw"] = (
         ELITE_GAP * np.exp(-RANK_IMPORTANCE * (players_df["Rank"] - 1))
     ).round(2)
 else:
-    # 1) Start from relative PPR points
     rel_pts = (players_df["ModelPoints"] / max_pts).clip(0.0001, 1.0)
-
-    # 2) Make the curve steeper so elites separate more from mid-tier
     curve_power = 1.6 + (RANK_IMPORTANCE - 0.015) * 30.0
     base_curve = np.power(rel_pts, curve_power)
-
-    # 3) Tier multiplier: top overall ranks get a little extra bump
     overall_rank = players_df["Rank"].rank(method="first")
-
     tier_mult_raw = np.where(
         overall_rank <= 12, 1.30,
         np.where(
@@ -612,15 +583,10 @@ else:
             )
         )
     )
-
-    # 4) Dynamic tier tweak based on positional scarcity
     pos_sc = players_df["Pos"].map(scarcity_mult).fillna(1.0).values
-    # If a position is scarcer (>1.0), elites get a bit more boost; if abundant (<1.0), a bit less
     tier_mult = tier_mult_raw * (1.0 + 0.35 * (pos_sc - 1.0))
-
     players_df["BaseValueRaw"] = (ELITE_GAP * base_curve * tier_mult).round(2)
 
-# 5) Apply age & risk multipliers
 if "Age" in players_df.columns:
     players_df["AgeMult"] = players_df.apply(lambda r: age_mult_for_player(r["Pos"], r["Age"]), axis=1)
     players_df["RiskMult"] = players_df.apply(lambda r: risk_mult_for_player(r["Pos"], r["Age"]), axis=1)
@@ -632,10 +598,7 @@ players_df["BaseValue"] = (
     players_df["BaseValueRaw"] * players_df["PosMult"] * players_df["AgeMult"] * players_df["RiskMult"]
 ).round(2)
 
-# ====================================================
-# Team ages (for pick context) using the same age table
-# ====================================================
-
+# Team ages for pick context
 team_avg_age = {}
 league_avg_age = None
 if ages_table is not None and not rosters_df.empty:
@@ -644,7 +607,7 @@ if ages_table is not None and not rosters_df.empty:
     roster_with_norm["Norm"] = roster_with_norm["Player"].apply(normalize_name)
     ages_norm["Norm"] = ages_norm["Norm"].astype(str)
     roster_with_norm = roster_with_norm.merge(
-        ages_norm[["Norm", "Age"]], on="Norm", how="left"
+        ages_norm["Norm", "Age"], on="Norm", how="left"
     )
     grp = roster_with_norm.groupby("Team")["Age"].mean()
     team_avg_age = grp.to_dict()
@@ -678,7 +641,8 @@ def apply_need(pos, team_counts):
 
 def roster_players(team: str):
     names = rosters_df.loc[rosters_df["Team"] == team, "Player"].tolist()
-    names = [n for n in names if n in set(players_df["Player"])]
+    name_set = set(players_df["Player"])
+    names = [n for n in names if n in name_set]
     names.sort(key=lambda x: x.lower())
     return names
 
@@ -830,13 +794,11 @@ def needs_and_risk_summary(team, before_counts, after_counts, incoming_details):
     inc_counts = {"QB": 0, "RB": 0, "WR": 0, "TE": 0}
     for _, pos, _, _, _, _ in incoming_details:
         inc_counts[pos] = inc_counts.get(pos, 0) + 1
-
     for pos in ["QB", "RB", "WR", "TE"]:
         tgt = int(DEFAULT_TARGETS.get(pos, 0))
         before = before_counts.get(pos, 0)
         after = after_counts.get(pos, 0)
         inc = inc_counts.get(pos, 0)
-
         if inc > 0 and before < tgt:
             if before == 0 and pos == "QB":
                 notes.append(
@@ -848,13 +810,11 @@ def needs_and_risk_summary(team, before_counts, after_counts, incoming_details):
                     f"{team} could use more {pos}s (goes from {before} to {after} at {pos}), "
                     f"so this trade helps their depth."
                 )
-
         if after < max(1, tgt) and before >= after:
             notes.append(
                 f"After this trade, {team} would have {after} {pos}(s) "
                 f"(we usually aim for around {tgt}), so they might worry about {pos} depth."
             )
-
     return notes
 
 def pick_summary(pick_details):
@@ -873,7 +833,6 @@ def pick_summary(pick_details):
 def suggest_trade_balance(team_favored, team_behind, gap, favored_send_players, favored_send_picks):
     if gap < 50:
         return None
-
     candidates = []
     for lbl in build_pick_labels_for_team(team_favored):
         if lbl in favored_send_picks:
@@ -882,7 +841,6 @@ def suggest_trade_balance(team_favored, team_behind, gap, favored_send_players, 
         if v <= 0:
             continue
         candidates.append(("pick", lbl, v))
-
     for p in roster_players(team_favored):
         if p in favored_send_players:
             continue
@@ -890,10 +848,8 @@ def suggest_trade_balance(team_favored, team_behind, gap, favored_send_players, 
         if v <= 0:
             continue
         candidates.append(("player", p, v))
-
     if not candidates:
         return None
-
     best = None
     for kind, name, v in candidates:
         if best is None or abs(v - gap) < abs(best[2] - gap):
@@ -961,7 +917,6 @@ with tab_trade:
             if not (a_send_players or a_send_picks or b_send_players or b_send_picks):
                 st.info("Build a trade by selecting at least one player or pick on either side.")
             else:
-                # Each side RECEIVES:
                 A_get_players, A_get_p_det = sum_players_value(b_send_players, teamA)
                 A_get_picks,   A_get_pk_det = sum_picks_value(b_send_picks)
                 A_get_total = A_get_players + A_get_picks
@@ -1106,8 +1061,9 @@ with tab_trade:
                     )
 
                 def key_pieces(details):
+                    """Return a small DataFrame of key players for display."""
                     if not details:
-                        return pd.DataFrame()
+                        return pd.DataFrame(columns=["Player", "Pos", "FP Rank", "Base Value", "Need Mult", "Final Value"])
                     df = pd.DataFrame(details, columns=["Player", "Pos", "FP Rank", "Base Value", "Need Mult", "Final Value"])
                     df = df.sort_values("Final Value", ascending=False)
                     return df.head(5)
