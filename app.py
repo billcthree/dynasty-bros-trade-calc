@@ -1095,17 +1095,29 @@ def build_asset_lists_for_team(team):
     return player_vals, pick_vals
 
 def matches_position_type(player_name: str, selection: str) -> bool:
-    """Filter by High-Tier / Starter / Flex / Depth / Young."""
+    """
+    Filter by High-Tier / Starter / Flex / Depth / Young.
+
+    If we *do* have age data, "Young" means Age <= 26.
+    If we *don't* have reliable age data (all NaN), we fall back to
+    using overall rank as a proxy for "young-ish, future-friendly assets".
+    """
     if selection == "Any":
         return True
     r = players_df.loc[players_df["Player"] == player_name]
     if r.empty:
         return True
+
     tier = r["TierGroup"].iloc[0]
-    is_young = r["IsYoung"].iloc[0]
+    is_young_flag = bool(r["IsYoung"].iloc[0]) if "IsYoung" in r.columns else False
 
     if selection == "Young":
-        return is_young
+        # If we actually have age data, use it
+        if "IsYoung" in players_df.columns and players_df["IsYoung"].any():
+            return is_young_flag
+        # Fallback: treat reasonably high-ranked players as "young assets"
+        rank_val = float(r["Rank"].iloc[0])
+        return rank_val <= 120.0
     else:
         return tier == selection
 
@@ -1557,7 +1569,7 @@ with tab_finder:
                 "Starter: usually in the lineup\n"
                 "Flex: could be in a flex spot\n"
                 "Depth: bench/injury fill-in\n"
-                "Young: age 26 or younger (independent of tier)"
+                "Young: age 26 or younger (independent of tier; or top ~120 overall if age data missing)"
             ),
         )
 
@@ -1674,9 +1686,24 @@ with tab_finder:
                     "Try broadening positions, relaxing pick rounds, or adjusting sliders."
                 )
             else:
+                # Sort by closeness and limit duplicate targets
                 suggestions_all.sort(key=lambda s: s["Approx value gap"])
+                filtered = []
+                target_counts = {}  # key = tuple(sorted(You Get)) -> how many times used
+
+                for s in suggestions_all:
+                    key = tuple(sorted(s["You Get"]))
+                    count = target_counts.get(key, 0)
+                    # At most 2 suggestions per unique target package
+                    if count >= 2:
+                        continue
+                    filtered.append(s)
+                    target_counts[key] = count + 1
+                    if len(filtered) >= 3:
+                        break
+
                 st.markdown("### Suggested ideas")
-                for i, sug in enumerate(suggestions_all[:3], start=1):
+                for i, sug in enumerate(filtered, start=1):
                     st.markdown(f"**Idea #{i}** — {sug['From']} ↔ {sug['To']}")
                     st.write(
                         f"{sug['From']} sends: "
