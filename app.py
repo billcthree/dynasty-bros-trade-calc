@@ -1,1353 +1,934 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime
-from itertools import combinations
-import random
 import requests
+from functools import lru_cache
 
-# -------------------- Page config --------------------
 st.set_page_config(page_title="Dynasty Bros. Trade Calculator", layout="wide")
 
-st.markdown("## Dynasty Bros. Trade Calculator")
-st.caption(
-    "Superflex PPR trade calculator using FantasyPros rankings and live Sleeper rosters."
-)
-st.markdown(
-    "Using **FantasyPros Dynasty Superflex PPR** rankings as the baseline for player value "
-    "(latest list from FantasyPros: "
-    "[FantasyPros Dynasty SF PPR rankings](https://www.fantasypros.com/nfl/rankings/dynasty-superflex.php))."
-)
+FANTASYPROS_URL = "https://www.fantasypros.com/nfl/rankings/dynasty-superflex.php"
+SLEEPER_LEAGUE_ID = "1194681871141023744"
+SLEEPER_API_BASE = "https://api.sleeper.app/v1"
+CURRENT_SEASON = 2025  # used only to decide which future pick seasons to show
+FUTURE_PICK_SEASONS = [2026, 2027, 2028]
+PICK_ROUNDS = [1, 2, 3, 4]
 
-# ====================================================
-# Helpers: name normalization, Sleeper fetch w/ picks
-# ====================================================
+# ---------- Helpers ----------
 
-
-def normalize_name(name: str) -> str:
-    """Normalize player names so Brian Thomas / Brian Thomas Jr. match."""
+def canon_name(name: str) -> str:
+    """Normalize names so Brian Thomas Jr. ≈ Brian Thomas, etc."""
     if not isinstance(name, str):
         return ""
-    name = name.lower().replace(".", " ").replace(",", " ").strip()
-    tokens = [
-        t
-        for t in name.split()
-        if t not in {"jr", "sr", "ii", "iii", "iv", "v"} and len(t) > 1
-    ]
-    return " ".join(tokens)
-
+    n = name.lower().strip()
+    for suf in [" jr.", " sr.", " jr", " sr", " ii", " iii", " iv"]:
+        if n.endswith(suf):
+            n = n[: -len(suf)]
+    bad = ".'`\"-"
+    for ch in bad:
+        n = n.replace(ch, " ")
+    n = " ".join(n.split())
+    return n
 
 @st.cache_data(show_spinner=False)
-def load_sleeper_league_v2(league_id: str):
+def fetch_json(url: str):
+    resp = requests.get(url, timeout=10)
+    resp.raise_for_status()
+    return resp.json()
+
+@st.cache_data(show_spinner=False)
+def fetch_text(url: str):
+    resp = requests.get(url, timeout=10, headers={"User-Agent": "dynasty-bros-trade-calc"})
+    resp.raise_for_status()
+    return resp.text
+
+@st.cache_data(show_spinner=False)
+def load_fantasypros_table():
     """
-    Fetch Sleeper league info + users + rosters + records + NFL player DB + traded picks.
-
-    Returns:
-      rosters_df: Team, Player, Pos
-      records_df: Team, Wins, Losses, Ties
-      picks_by_team: { current_owner_team: [pick_label, ...] }
-      pick_label_to_original: { pick_label: original_team_name }
-      future_years: list[int] of seasons we built picks for
+    Try live FantasyPros. Fall back to local CSV if needed.
+    Returns a DataFrame with at least: Player, Pos, Rank.
     """
-    base = f"https://api.sleeper.app/v1/league/{league_id}"
-    league_info = requests.get(base, timeout=20).json()
-    season = int(league_info.get("season", datetime.now().year))
-    draft_rounds = int(league_info.get("draft_rounds", 4))
+    df = None
+    # 1) live
+    try:
+        html = fetch_text(FANTASYPROS_URL)
+        tables = pd.read_html(html)
+        if tables:
+            df = tables[0]
+    except Exception:
+        df = None
 
-    # Only care about drafts that haven't happened yet: next 3 after current season
-    future_years = [season + i for i in [1, 2, 3]]
-
-    users = requests.get(base + "/users", timeout=20).json()
-    rosts = requests.get(base + "/rosters", timeout=20).json()
-    traded = requests.get(base + "/traded_picks", timeout=20).json()
-    players_nfl = requests.get("https://api.sleeper.app/v1/players/nfl", timeout=30).json()
-
-    # Map owner_id -> nice team name
-    id_to_name = {}
-    for i, u in enumerate(users):
-        meta = u.get("metadata") or {}
-        team_name = (
-            meta.get("team_name")
-            or u.get("display_name")
-            or f"Team {i+1}"
-        )
-        id_to_name[u.get("user_id")] = team_name
-
-    rows = []
-    records = {}
-    rosterid_to_team = {}
-
-    for r in rosts:
-        owner_id = r.get("owner_id")
-        roster_id = r.get("roster_id")
-
-        team_label = id_to_name.get(owner_id, f"Team {roster_id}")
-        rosterid_to_team[roster_id] = team_label
-
-        settings = r.get("settings") or {}
-        wins = settings.get("wins", 0)
-        losses = settings.get("losses", 0)
-        ties = settings.get("ties", 0)
-
-        records[team_label] = {
-            "Team": team_label,
-            "Wins": wins,
-            "Losses": losses,
-            "Ties": ties,
-        }
-
-        for pid in (r.get("players") or []):
-            pl = players_nfl.get(str(pid), {})
-            full_name = pl.get("full_name") or (
-                ((pl.get("first_name") or "") + " " + (pl.get("last_name") or "")).strip()
-            )
-            pos = pl.get("position")
-            if not full_name or pos not in ["QB", "RB", "WR", "TE"]:
-                continue
-            rows.append({"Team": team_label, "Player": full_name, "Pos": pos})
-
-    rosters_df = pd.DataFrame(rows)
-    records_df = (
-        pd.DataFrame(records.values())
-        if records
-        else pd.DataFrame(columns=["Team", "Wins", "Losses", "Ties"])
-    )
-
-    # ---------- Build future pick ownership ----------
-    picks_current_owner = {}  # (year, round, original_roster_id) -> current_owner_team
-
-    # Initial ownership = original owner
-    for r in rosts:
-        rid = r.get("roster_id")
-        original_team = rosterid_to_team.get(rid)
-        if not original_team:
-            continue
-        for yr in future_years:
-            for rnd in range(1, draft_rounds + 1):
-                picks_current_owner[(yr, rnd, rid)] = original_team
-
-    # Apply traded picks list (final state)
-    for tp in traded or []:
+    # 2) local CSV fallback
+    if df is None:
         try:
-            yr = int(tp.get("season", 0))
-            rnd = int(tp.get("round", 0))
-            orig_rid = tp.get("roster_id")
-            new_owner_rid = tp.get("owner_id")
+            df = pd.read_csv("data/player_ranks.csv")
         except Exception:
-            continue
+            return pd.DataFrame(columns=["Player", "Pos", "Rank"])
 
-        if yr not in future_years:
-            continue
-        if rnd < 1 or rnd > draft_rounds:
-            continue
-        if orig_rid not in rosterid_to_team or new_owner_rid not in rosterid_to_team:
-            continue
+    cols = [str(c) for c in df.columns]
+    lower = [c.lower() for c in cols]
 
-        new_owner_team = rosterid_to_team[new_owner_rid]
-        picks_current_owner[(yr, rnd, orig_rid)] = new_owner_team
+    # find player column
+    player_col = None
+    for c in cols:
+        if "player" in c.lower():
+            player_col = c
+            break
+    if player_col is None and "Player" in cols:
+        player_col = "Player"
 
-    picks_by_team = {}          # current_owner -> [labels]
-    pick_label_to_original = {} # label -> original team
+    # find rank col
+    rank_col = None
+    for c in cols:
+        lc = c.lower()
+        if "rank" in lc or lc == "#" or lc == "ovr":
+            rank_col = c
+            break
+    if rank_col is None:
+        rank_col = cols[0]
 
-    for (yr, rnd, orig_rid), current_owner in picks_current_owner.items():
-        original_team = rosterid_to_team.get(orig_rid)
-        if not original_team or not current_owner:
-            continue
-        label = f"{yr} R{rnd} ({original_team})"
-        picks_by_team.setdefault(current_owner, []).append(label)
-        pick_label_to_original[label] = original_team
+    # find position col
+    pos_col = None
+    for c in cols:
+        if "pos" in c.lower():
+            pos_col = c
+            break
 
-    for tm in picks_by_team:
-        picks_by_team[tm] = sorted(picks_by_team[tm])
+    # if we cannot find player column, just assume CSV is already formatted
+    if player_col is None or pos_col is None:
+        out = df.copy()
+        if "Rank" not in out.columns and rank_col in out.columns:
+            out = out.rename(columns={rank_col: "Rank"})
+        if "Player" not in out.columns and player_col is not None:
+            out = out.rename(columns={player_col: "Player"})
+        if "Pos" not in out.columns and pos_col is not None:
+            out = out.rename(columns={pos_col: "Pos"})
+        keep = [c for c in ["Player", "Pos", "Rank"] if c in out.columns]
+        return out[keep]
 
-    return rosters_df, records_df, picks_by_team, pick_label_to_original, future_years
-
+    out = df[[player_col, pos_col, rank_col]].copy()
+    out.columns = ["Player", "Pos", "Rank"]
+    # Pos often comes like "WR1" or "WR". Strip trailing numbers
+    out["Pos"] = out["Pos"].astype(str).str.extract(r"([A-Z]+)", expand=False)
+    out["Rank"] = pd.to_numeric(out["Rank"], errors="coerce")
+    out = out.dropna(subset=["Rank"])
+    return out
 
 @st.cache_data(show_spinner=False)
-def load_sleeper_logos(league_id: str):
-    """
-    Optional: league + team logos from Sleeper.
-
-    Returns (league_logo_url, {team_name: logo_url})
-    """
-    base = f"https://api.sleeper.app/v1/league/{league_id}"
-    league_info = requests.get(base, timeout=20).json()
-    users = requests.get(base + "/users", timeout=20).json()
-    rosts = requests.get(base + "/rosters", timeout=20).json()
-
-    league_logo = None
-    if league_info.get("avatar"):
-        league_logo = f"https://sleepercdn.com/avatars/{league_info['avatar']}"
-
-    # owner_id -> (team_name, avatar_url)
-    owner_to_team = {}
-    for i, u in enumerate(users):
-        meta = u.get("metadata") or {}
-        team_name = (
-            meta.get("team_name")
-            or u.get("display_name")
-            or f"Team {i+1}"
-        )
-        avatar_id = meta.get("team_avatar") or u.get("avatar")
-        avatar_url = f"https://sleepercdn.com/avatars/{avatar_id}" if avatar_id else None
-        owner_to_team[u.get("user_id")] = (team_name, avatar_url)
-
-    team_logo = {}
-    for r in rosts:
-        owner_id = r.get("owner_id")
-        if owner_id not in owner_to_team:
-            continue
-        team_name, avatar_url = owner_to_team[owner_id]
-        if avatar_url:
-            team_logo[team_name] = avatar_url
-
-    return league_logo, team_logo
-
+def load_age_table():
+    """Optional age data (fantasyage.csv)."""
+    try:
+        df = pd.read_csv("data/fantasyage.csv")
+    except Exception:
+        return pd.DataFrame(columns=["Player", "Age"])
+    if "Player" not in df.columns:
+        return pd.DataFrame(columns=["Player", "Age"])
+    df["Age"] = pd.to_numeric(df.get("Age"), errors="coerce")
+    df["name_key"] = df["Player"].map(canon_name)
+    return df[["name_key", "Age"]]
 
 @st.cache_data(show_spinner=False)
 def load_ppr_curves():
     """
-    Load PPR scoring curves from data/ppr_curves.xlsx.
-
-    Expected sheets:
-    - QB24, RB24, WR24, TE24
-    Each sheet should have:
-    - '#' : position rank (1 = top scorer at that position)
-    - 'TTL': season total PPR points
+    Optional: read PPR .xlsx to get how fast value falls off by position.
+    If file missing, we just return None and later use hard-coded curves.
     """
     try:
-        xls = pd.ExcelFile("data/ppr_curves.xlsx")
+        ppr = pd.read_excel("data/PPR.xlsx")
     except Exception:
         return None
-
+    if "Pos" not in ppr.columns:
+        return None
+    if "Rank" not in ppr.columns:
+        for c in ppr.columns:
+            if "rk" in str(c).lower():
+                ppr = ppr.rename(columns={c: "Rank"})
+                break
+    if "Rank" not in ppr.columns:
+        return None
+    score_col = None
+    for c in ppr.columns:
+        if "ppr" in str(c).lower() or "points" in str(c).lower():
+            score_col = c
+            break
+    if score_col is None:
+        return None
+    ppr = ppr[["Pos", "Rank", score_col]].copy()
+    ppr = ppr.dropna()
+    ppr["Rank"] = pd.to_numeric(ppr["Rank"], errors="coerce")
+    ppr = ppr.dropna(subset=["Rank"])
+    ppr = ppr.rename(columns={score_col: "Pts"})
     curves = {}
-    mapping = {"QB": "QB24", "RB": "RB24", "WR": "WR24", "TE": "TE24"}
-
-    for pos, sheet in mapping.items():
-        if sheet not in xls.sheet_names:
+    for pos, sub in ppr.groupby("Pos"):
+        sub = sub.sort_values("Rank")
+        top = sub["Pts"].iloc[0]
+        if top <= 0:
             continue
-        df = xls.parse(sheet)
-        if "#" not in df.columns or "TTL" not in df.columns:
-            continue
-        tmp = df[["#", "TTL"]].copy()
-        tmp = tmp.rename(columns={"#": "PosRank", "TTL": "Points"})
-        tmp["PosRank"] = pd.to_numeric(tmp["PosRank"], errors="coerce")
-        tmp["Points"] = pd.to_numeric(tmp["Points"], errors="coerce")
-        tmp = tmp.dropna().sort_values("PosRank")
-        if not tmp.empty:
-            curves[pos] = tmp.reset_index(drop=True)
-
-    return curves if curves else None
-
+        sub["Norm"] = sub["Pts"] / top
+        curves[pos] = sub[["Rank", "Norm"]].reset_index(drop=True)
+    return curves
 
 @st.cache_data(show_spinner=False)
-def load_age_table():
-    """
-    Load player ages from data/fantasyage.csv (Player, Age or Player, Yrs).
-    Used only for small adjustments to player values and pick values.
-    """
-    try:
-        df = pd.read_csv("data/fantasyage.csv")
-    except Exception:
-        return None
+def build_player_pool():
+    fp = load_fantasypros_table()
+    if fp.empty:
+        return pd.DataFrame()
 
-    cols = [c.lower() for c in df.columns]
-    df.columns = cols
+    fp["name_key"] = fp["Player"].map(canon_name)
+    fp = fp.drop_duplicates(subset=["name_key"], keep="first")
 
-    if "player" not in cols or ("age" not in cols and "yrs" not in cols):
-        return None
-
-    age_col = "age" if "age" in cols else "yrs"
-    out = df[["player", age_col]].rename(columns={"player": "Player", age_col: "Age"})
-    out["Age"] = pd.to_numeric(out["Age"], errors="coerce")
-    out = out.dropna(subset=["Age"])
-    out["Norm"] = out["Player"].apply(normalize_name)
-    return out
-
-
-@st.cache_data(show_spinner=False)
-def load_player_ranks(uploaded_file):
-    """
-    Load FantasyPros-like player ranks.
-
-    Expected columns: Player, Pos, Rank.
-    """
-    if uploaded_file is not None:
-        df = pd.read_csv(uploaded_file)
+    age_df = load_age_table()
+    if not age_df.empty:
+        fp = fp.merge(age_df, on="name_key", how="left")
     else:
-        df = pd.read_csv("data/player_ranks.csv")
+        fp["Age"] = np.nan
 
-    cols = {c.lower(): c for c in df.columns}
-    # normalize column names
-    rename_map = {}
-    if "player" in cols:
-        rename_map[cols["player"]] = "Player"
-    if "pos" in cols:
-        rename_map[cols["pos"]] = "Pos"
-    if "rank" in cols:
-        rename_map[cols["rank"]] = "Rank"
+    fp["PosRank"] = fp.groupby("Pos")["Rank"].rank("first")
 
-    df = df.rename(columns=rename_map)
-    df["Norm"] = df["Player"].apply(normalize_name)
-    df["Rank"] = pd.to_numeric(df["Rank"], errors="coerce")
-    df = df.dropna(subset=["Rank"])
-    df = df.sort_values("Rank").reset_index(drop=True)
-    return df
+    curves = load_ppr_curves()
 
+    def base_curve(pos, pos_rank):
+        # generic fallback; top players are heavily separated
+        params = {
+            "QB": (525, 0.55),
+            "RB": (500, 0.58),
+            "WR": (480, 0.60),
+            "TE": (360, 0.62),
+        }
+        base, exp = params.get(pos, (450, 0.60))
+        return base * (pos_rank ** (-exp))
 
-# ====================================================
-# Sidebar: data source + modifiers
-# ====================================================
-
-st.sidebar.header("1) Data Source")
-
-use_live = st.sidebar.checkbox(
-    "Use live Sleeper + FantasyPros data",
-    value=True,
-    help=(
-        "On: rosters/records from Sleeper API, rankings from data/player_ranks.csv "
-        "(FantasyPros export)."
-    ),
-)
-
-league_id = st.sidebar.text_input(
-    "Sleeper League ID",
-    value="1194681871141023744",
-    help="Paste your Sleeper league ID (from league settings in the Sleeper app).",
-)
-
-st.sidebar.caption("You can still upload CSVs below to override or test things manually.")
-
-up_players = st.sidebar.file_uploader("Player Ranks CSV (Player, Pos, Rank)", type=["csv"])
-up_rosters = st.sidebar.file_uploader(
-    "Rosters CSV (Team, Player, Pos optional)", type=["csv"]
-)
-
-# -------- Modifiers ----------
-st.sidebar.header("2) Player value tuning (optional)")
-st.sidebar.caption(
-    "If you're not sure what to do here, you can safely leave the defaults."
-)
-
-ELITE_GAP = st.sidebar.slider(
-    "How valuable is the #1 overall player?",
-    800.0,
-    2200.0,
-    1600.0,
-    50.0,
-    help=(
-        "Higher = bigger gap between elite players and everyone else. "
-        "This also exaggerates the difference between players in the top ~30 and the rest."
-    ),
-)
-
-RANK_IMPORTANCE = st.sidebar.slider(
-    "How fast does value drop as players get lower in the rankings?",
-    0.020,
-    0.080,
-    0.050,
-    0.001,
-    help=(
-        "Higher = rank differences matter more (e.g., Rank 13 >> Rank 46 >> Rank 137). "
-        "This especially stretches the top end (WR1 vs WR20 etc.)."
-    ),
-)
-
-NEED_WEIGHT = st.sidebar.slider(
-    "How much do roster needs matter?",
-    0.0,
-    0.6,
-    0.20,
-    0.05,
-    help=(
-        "Lower = mostly pure rankings. Higher = small boost when a trade fills a thin "
-        "position or helps a team that is very old at a spot."
-    ),
-)
-
-PACKAGE_PENALTY = st.sidebar.slider(
-    "2-for-1 tax (multiple smaller players vs one stud)",
-    0.0,
-    1.0,
-    0.65,
-    0.05,
-    help=(
-        "Higher = quantity counts less vs quality. "
-        "Prevents 3 mid players from 'beating' 1 superstar."
-    ),
-)
-
-RISK_PREF = st.sidebar.slider(
-    "Risk vs safety preference",
-    0.0,
-    1.0,
-    0.5,
-    0.05,
-    help=(
-        "0 = mildly prefers safer, older producers. 1 = mildly prefers youth/upside. "
-        "This is a small nudge on top of the ranking-based value."
-    ),
-)
-
-# ==========================================
-# Load main datasets (ranks, rosters, logos)
-# ==========================================
-
-curves = load_ppr_curves()
-age_table = load_age_table()
-
-if use_live:
-    try:
-        rosters_live, records_live, picks_by_team_live, pick_label_to_original, future_years = (
-            load_sleeper_league_v2(league_id)
-        )
-    except Exception as e:
-        st.error(f"Error fetching Sleeper data: {e}")
-        rosters_live = records_live = None
-        picks_by_team_live = {}
-        pick_label_to_original = {}
-        future_years = []
-else:
-    rosters_live = records_live = None
-    picks_by_team_live = {}
-    pick_label_to_original = {}
-    future_years = []
-
-# Apply manual override rosters if uploaded
-if up_rosters is not None:
-    rosters = pd.read_csv(up_rosters)
-    if "Pos" not in rosters.columns and "Position" in rosters.columns:
-        rosters = rosters.rename(columns={"Position": "Pos"})
-else:
-    rosters = rosters_live
-
-players_fp = load_player_ranks(up_players)
-
-if rosters is None or rosters.empty:
-    st.error(
-        "No rosters available. Check Sleeper league ID, or upload a Rosters CSV with "
-        "columns (Team, Player, Pos)."
-    )
-    st.stop()
-
-# ---------------- Merge Sleeper rosters with FantasyPros ranks ----------------
-
-rosters = rosters.copy()
-rosters["Norm"] = rosters["Player"].apply(normalize_name)
-players_fp = players_fp.copy()
-
-merged = pd.merge(
-    rosters,
-    players_fp[["Norm", "Player", "Pos", "Rank"]],
-    on="Norm",
-    how="left",
-    suffixes=("_Sleeper", "_FP"),
-)
-
-# fallbacks if FP pos is missing
-merged["Pos_final"] = merged["Pos_FP"].fillna(merged["Pos_Sleeper"])
-merged["Rank"] = pd.to_numeric(merged["Rank"], errors="coerce")
-
-# If still NaN rank, push them to very low value but not zero
-max_rank = merged["Rank"].max(skipna=True)
-if pd.isna(max_rank):
-    max_rank = 400
-merged["Rank_filled"] = merged["Rank"].fillna(max_rank + 40)
-
-# --------------------------------------
-# Build position rank & value per player
-# --------------------------------------
-
-
-def build_pos_rank(df: pd.DataFrame) -> pd.DataFrame:
-    # rank within each position based on overall Rank_filled
-    df = df.copy()
-    df["PosRank"] = (
-        df.sort_values("Rank_filled")
-        .groupby("Pos_final")["Rank_filled"]
-        .rank(method="first")
-    )
-    return df
-
-
-merged = build_pos_rank(merged)
-
-
-def get_ppr_points_for_pos(pos: str, pos_rank: float) -> float:
-    """Approximate PPR points at a given position rank using curves (if available)."""
-    if curves is None or pos not in curves:
-        # simple fall-back: exponential decay for positions
-        # slightly steeper for QB & TE due to scarcity
-        base = {"QB": 380, "RB": 330, "WR": 320, "TE": 220}.get(pos, 250)
-        decay = {"QB": 0.055, "RB": 0.045, "WR": 0.040, "TE": 0.050}.get(pos, 0.045)
-        return base * np.exp(-decay * (pos_rank - 1))
-
-    curve = curves[pos]
-    # If we have exact rank
-    if pos_rank <= curve["PosRank"].max():
-        # simple interpolation
-        idx = np.searchsorted(curve["PosRank"].values, pos_rank, side="right") - 1
-        idx = max(0, min(idx, len(curve) - 1))
-        return float(curve.iloc[idx]["Points"])
-
-    # beyond known curve: tail off
-    last_points = float(curve["Points"].iloc[-1])
-    extra = pos_rank - curve["PosRank"].iloc[-1]
-    return last_points * (0.96 ** extra)
-
-
-def pos_weight(pos: str) -> float:
-    """
-    Slight positional weighting so TE doesn't randomly outrank elite WR/RB too often.
-    """
-    return {
-        "QB": 1.05,  # very important in superflex
-        "RB": 1.00,
-        "WR": 1.00,
-        "TE": 0.88,  # nerf TE a bit overall
-    }.get(pos, 1.0)
-
-
-def age_adjustment(player_name: str, base_val: float, pos: str) -> float:
-    """
-    Small adjustment based on age.
-    RB/WR: age cliff a bit earlier
-    QB: age matters less
-    TE: medium
-    """
-    if age_table is None or base_val <= 0:
-        return base_val
-
-    norm = normalize_name(player_name)
-    row = age_table.loc[age_table["Norm"] == norm]
-    if row.empty:
-        return base_val
-
-    age = float(row["Age"].iloc[0])
-
-    # target prime windows
-    if pos == "QB":
-        # long shelf life, mild penalty late
-        if age <= 26:
-            mult = 1.05
-        elif age <= 30:
-            mult = 1.02
-        elif age <= 34:
-            mult = 0.98
-        else:
-            mult = 0.92
-    elif pos in ["RB"]:
-        if age <= 23:
-            mult = 1.06
-        elif age <= 26:
-            mult = 1.02
-        elif age <= 28:
-            mult = 0.96
-        else:
-            mult = 0.90
-    elif pos == "WR":
-        if age <= 24:
-            mult = 1.05
-        elif age <= 28:
-            mult = 1.02
-        elif age <= 30:
-            mult = 0.97
-        else:
-            mult = 0.92
-    else:  # TE
-        if age <= 25:
-            mult = 1.04
-        elif age <= 29:
-            mult = 1.01
-        elif age <= 32:
-            mult = 0.97
-        else:
-            mult = 0.92
-
-    # tilt slightly based on RISK_PREF
-    # 0 = prefers vets (less penalty), 1 = prefers youth (more penalty on old)
-    if age >= 28:
-        mult *= (0.99 + 0.05 * (1.0 - RISK_PREF))  # older gets a bit more forgiveness if risk_pref is low
-    elif age <= 24:
-        mult *= (1.0 + 0.05 * RISK_PREF)
-
-    return base_val * mult
-
-
-def build_player_values(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Combine:
-      - Overall FantasyPros Rank (Rank_filled)
-      - Positional rank -> PPR points curve
-      - Positional weighting
-      - Age adjustments
-      - Stronger separation for elite players (using RANK_IMPORTANCE + ELITE_GAP)
-    """
-    df = df.copy()
-    max_rank_local = df["Rank_filled"].max()
+    # small extra separation for some positions
+    exp_boost = {"QB": 0.0, "RB": 0.0, "WR": 0.05, "TE": 0.08}
 
     values = []
-    for _, row in df.iterrows():
-        player = row["Player_FP"] if "Player_FP" in row and isinstance(row["Player_FP"], str) else row["Player"]
-        pos = row["Pos_final"]
-        overall_rank = float(row["Rank_filled"])
-        pos_rank = float(row["PosRank"])
-
-        # PPR curve
-        ppr_points = get_ppr_points_for_pos(pos, pos_rank)
-
-        # Normalize PPR per position
+    for _, row in fp.iterrows():
+        pos = row["Pos"]
+        pr = float(row["PosRank"])
+        v = base_curve(pos, pr)
         if curves is not None and pos in curves:
-            top_points = float(curves[pos]["Points"].iloc[0])
-        else:
-            top_points = get_ppr_points_for_pos(pos, 1.0)
-        norm_ppr = ppr_points / top_points if top_points > 0 else 1.0
-
-        # Rank-based exponent curve:
-        # Big separation at the very top, then it flattens
-        # rank_factor roughly between ~1.0 (rank 1) and small numbers at 200+
-        rank_factor = np.exp(-RANK_IMPORTANCE * (overall_rank - 1.0))
-
-        # emphasize top 20-30 extra by bending the curve
-        elite_boost = 1.0
-        if overall_rank <= 5:
-            elite_boost = 1.30
-        elif overall_rank <= 12:
-            elite_boost = 1.18
-        elif overall_rank <= 24:
-            elite_boost = 1.10
-        elif overall_rank <= 40:
-            elite_boost = 1.04
-
-        # Combine
-        base_val = ELITE_GAP * rank_factor * (0.35 + 0.65 * norm_ppr) * pos_weight(pos) * elite_boost
-
-        # Age tweak
-        base_val = age_adjustment(player, base_val, pos)
-
-        values.append(base_val)
-
-    df["BaseValue"] = values
-    return df
-
-
-merged = build_player_values(merged)
-
-# Make a simple player-value table for quick lookups
-player_values = merged.groupby(["Player", "Pos_final"], as_index=False).agg(
-    {"BaseValue": "mean", "Rank_filled": "mean"}
-)
-player_values = player_values.rename(columns={"Pos_final": "Pos", "Rank_filled": "Rank"})
-
-
-def get_player_value(name: str) -> float:
-    row = player_values.loc[player_values["Player"] == name]
-    if row.empty:
-        return 0.0
-    return float(row["BaseValue"].iloc[0])
-
-
-def get_player_rank_pos(name: str):
-    row = player_values.loc[player_values["Player"] == name]
-    if row.empty:
-        return None, None, None
-    return float(row["Rank"].iloc[0]), row["Pos"].iloc[0], float(row["BaseValue"].iloc[0])
-
-
-# ============================================
-# Roster context & team need multipliers
-# ============================================
-
-def team_pos_counts(team_name: str):
-    sub = merged.loc[merged["Team"] == team_name]
-    counts = {p: int((sub["Pos_final"] == p).sum()) for p in ["QB", "RB", "WR", "TE"]}
-    return counts
-
-
-def team_age_profile(team_name: str):
-    if age_table is None:
-        return {}
-    sub = merged.loc[merged["Team"] == team_name]
-    if sub.empty:
-        return {}
-    res = {}
-    for pos in ["QB", "RB", "WR", "TE"]:
-        pos_players = sub.loc[sub["Pos_final"] == pos]
-        if pos_players.empty:
-            continue
-        ages = []
-        for p in pos_players["Player_FP"].fillna(pos_players["Player"]):
-            norm = normalize_name(p)
-            arow = age_table.loc[age_table["Norm"] == norm]
-            if not arow.empty:
-                ages.append(float(arow["Age"].iloc[0]))
-        if ages:
-            res[pos] = np.mean(ages)
-    return res
-
-
-DEFAULT_TARGETS = {"QB": 3, "RB": 5, "WR": 6, "TE": 2}
-
-
-def need_score_for_pos(count: int, target: int) -> float:
-    """
-    Return a small need score in [-1, +1] based on how far from target a team is.
-    """
-    if target <= 0:
-        return 0.0
-    diff = count - target
-    if diff <= -2:
-        return 1.0
-    if diff == -1:
-        return 0.5
-    if diff == 0:
-        return 0.0
-    if diff == 1:
-        return -0.4
-    return -0.7
-
-
-def team_need_multiplier(team_name: str, incoming_players: list[str]) -> tuple[float, list]:
-    """
-    Compute a combined team-need multiplier for all incoming players.
-
-    Returns:
-      total_mult (applied multiplicatively to combined value),
-      details: list of (Player, Pos, per-player-mult, short_reason)
-    """
-    counts_before = team_pos_counts(team_name)
-    details = []
-
-    # We'll treat each incoming player separately, and then combine multiplicatively.
-    total_mult = 1.0
-
-    for p in incoming_players:
-        rank, pos, base_val = get_player_rank_pos(p)
-        if pos is None:
-            continue
-
-        cnt = counts_before.get(pos, 0)
-        target = DEFAULT_TARGETS.get(pos, 0)
-        ns = need_score_for_pos(cnt, target)
-
-        # Use NEED_WEIGHT as the maximum additional bump
-        per_mult = 1.0 + NEED_WEIGHT * ns
-
-        # slight tweak for age windows: rebuilding teams may prefer youth, contenders vets
-        # we infer a bit from team record
-        if records_live is not None and not records_live.empty:
-            rec_row = records_live.loc[records_live["Team"] == team_name]
-            if not rec_row.empty:
-                wins = float(rec_row["Wins"].iloc[0])
-                losses = float(rec_row["Losses"].iloc[0])
-                total = wins + losses
-                win_pct = wins / total if total > 0 else 0.5
-                # contending team -> slightly more weight on current production
-                if win_pct >= 0.65:
-                    per_mult *= 1.02
-                elif win_pct <= 0.35:
-                    per_mult *= 1.02
-
-        total_mult *= per_mult
-
-        reason = ""
-        if ns > 0.4:
-            reason = f"{team_name} is light at {pos}, so acquiring {p} is slightly more valuable to them."
-        elif ns < -0.4:
-            reason = f"{team_name} is already deep at {pos}, so {p} is a bit less of a priority."
-        details.append((p, pos, round(per_mult, 3), reason))
-
-    return total_mult, details
-
-
-# =======================
-# Pick valuation
-# =======================
-
-def team_power_score(team_name: str) -> float:
-    """
-    Estimate how strong a team is (for pick value).
-
-    Uses:
-      - Wins/Losses
-      - Sum of top N player BaseValue
-    """
-    rec_score = 0.0
-    if records_live is not None and not records_live.empty:
-        row = records_live.loc[records_live["Team"] == team_name]
-        if not row.empty:
-            wins = float(row["Wins"].iloc[0])
-            losses = float(row["Losses"].iloc[0])
-            total = wins + losses
-            win_pct = wins / total if total > 0 else 0.5
-            rec_score = (win_pct - 0.5) * 4.0  # ~[-2, +2]
-
-    sub = merged.loc[merged["Team"] == team_name]
-    top_vals = sorted(sub["BaseValue"].tolist(), reverse=True)[:12]
-    if top_vals:
-        roster_score = (np.mean(top_vals) / (ELITE_GAP or 1.0)) * 4.0
-    else:
-        roster_score = 0.0
-
-    return rec_score * 0.6 + roster_score * 0.4
-
-
-def estimate_pick_slot(original_team: str, total_teams: int = 12) -> float:
-    """
-    Estimate likely draft slot (1 = 1.01, 12 = 1.12).
-    Lower power_score => earlier pick.
-    """
-    if not original_team:
-        return total_teams / 2
-
-    all_teams = sorted(rosters["Team"].unique().tolist())
-    scores = {t: team_power_score(t) for t in all_teams}
-    sorted_t = sorted(all_teams, key=lambda t: scores[t])
-
-    # worst score first => earliest pick
-    try:
-        idx = sorted_t.index(original_team)
-    except ValueError:
-        return total_teams / 2
-
-    return float(idx + 1)
-
-
-def pick_base_curve(round_num: int) -> float:
-    """
-    Base value for picks before slot adjustments.
-    Toned down compared to studs.
-    """
-    if round_num == 1:
-        return 650.0
-    if round_num == 2:
-        return 330.0
-    if round_num == 3:
-        return 140.0
-    if round_num == 4:
-        return 60.0
-    return 20.0
-
-
-def pick_value(label: str) -> float:
-    """
-    Given pick label like '2026 R1 (Wilfork Your Mom)', return numeric value.
-    """
-    try:
-        parts = label.split()
-        year = int(parts[0])
-        rnd = int(parts[1].replace("R", "").replace("(", "").replace(")", ""))
-    except Exception:
-        return 0.0
-
-    # parse original team name inside parentheses
-    start = label.find("(")
-    end = label.rfind(")")
-    original_team = ""
-    if start != -1 and end != -1 and end > start:
-        original_team = label[start + 1 : end]
-
-    base = pick_base_curve(rnd)
-
-    # adjust by expected slot: early picks get a decent bump
-    slot = estimate_pick_slot(original_team)
-    # slot from 1 (best) to ~12 (worst)
-    slot_mult = 1.25 - 0.5 * ((slot - 1) / max(slot - 1, 11))
-    slot_mult = max(0.7, min(1.3, slot_mult))
-
-    # very small fade for future years
-    current_year = datetime.now().year
-    year_diff = max(0, year - current_year)
-    time_mult = (0.95) ** year_diff
-
-    return base * slot_mult * time_mult
-
-
-# ==============================================
-# Utility: package penalty for many-for-one
-# ==============================================
-
-def apply_package_penalty(total_value: float, num_assets: int) -> float:
-    if num_assets <= 1:
-        return total_value
-    # each extra asset gets taxed a bit
-    tax = PACKAGE_PENALTY * (num_assets - 1) * 0.15
-    mult = max(0.60, 1.0 - tax)
-    return total_value * mult
-
-
-# ==========================================
-# UI: logos
-# ==========================================
-
-league_logo_url, team_logo_urls = (None, {})
-if use_live:
-    try:
-        league_logo_url, team_logo_urls = load_sleeper_logos(league_id)
-    except Exception:
-        league_logo_url, team_logo_urls = (None, {})
-
-if league_logo_url:
-    st.image(league_logo_url, width=60)
-
-
-# ==========================================
-# Tabs: Trade Calculator vs Trade Finder
-# ==========================================
-
-tab_calc, tab_finder = st.tabs(["Trade Calculator", "Trade Finder"])
-
-teams = sorted(rosters["Team"].unique().tolist())
-
-
-# ====================================================
-# TRADE CALCULATOR TAB
-# ====================================================
-
-with tab_calc:
-    st.markdown("### Build a Trade")
-
-    colA, colB = st.columns(2)
-    with colA:
-        teamA = st.selectbox("Team A", teams, index=0)
-        if teamA in team_logo_urls:
-            st.image(team_logo_urls[teamA], width=60)
-    with colB:
-        teamB = st.selectbox("Team B", teams, index=min(1, len(teams) - 1))
-        if teamB in team_logo_urls:
-            st.image(team_logo_urls[teamB], width=60)
-
-    st.markdown("#### Assets being moved (you can select multiple players and picks per side)")
-
-    # Player lists restricted to each roster
-    players_A = sorted(rosters.loc[rosters["Team"] == teamA, "Player"].unique().tolist())
-    players_B = sorted(rosters.loc[rosters["Team"] == teamB, "Player"].unique().tolist())
-
-    picksA = sorted(picks_by_team_live.get(teamA, []))
-    picksB = sorted(picks_by_team_live.get(teamB, []))
-
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown(f"**{teamA} receives from {teamB}**")
-        A_get_players = st.multiselect(
-            "Players to acquire",
-            options=players_B,
-            key="A_get_players",
-        )
-        A_get_picks = st.multiselect(
-            "Draft picks to acquire",
-            options=picksB,
-            key="A_get_picks",
-        )
-
-    with c2:
-        st.markdown(f"**{teamB} receives from {teamA}**")
-        B_get_players = st.multiselect(
-            "Players to acquire",
-            options=players_A,
-            key="B_get_players",
-        )
-        B_get_picks = st.multiselect(
-            "Draft picks to acquire",
-            options=picksA,
-            key="B_get_picks",
-        )
-
-    # ----------- Compute values -----------
-    def side_value(team_name: str, players_in: list[str], picks_in: list[str]):
-        # base sum
-        player_vals = []
-        for p in players_in:
-            v = get_player_value(p)
-            player_vals.append((p, v))
-        total_players = sum(v for _, v in player_vals)
-
-        total_picks = sum(pick_value(lbl) for lbl in picks_in)
-
-        base_total = total_players + total_picks
-
-        # team-need multiplier
-        need_mult, need_details = team_need_multiplier(team_name, players_in)
-        total_after_need = base_total * need_mult
-
-        # package tax (players only)
-        total_after_package = apply_package_penalty(
-            total_after_need,
-            num_assets=len(players_in),
-        )
-
-        return {
-            "base_total": base_total,
-            "total_players": total_players,
-            "total_picks": total_picks,
-            "after_need": total_after_need,
-            "after_package": total_after_package,
-            "player_vals": player_vals,
-            "need_details": need_details,
+            curve = curves[pos]
+            nearest = curve.iloc[(curve["Rank"] - pr).abs().argmin()]
+            norm = float(nearest["Norm"])
+            v = v * (0.7 + 0.6 * norm)
+        overall = float(row["Rank"])
+        if overall <= 12:
+            v *= 1.30
+        elif overall <= 24:
+            v *= 1.18
+        elif overall <= 48:
+            v *= 1.08
+
+        adj_exp = exp_boost.get(pos, 0.0)
+        if adj_exp:
+            v *= (pr ** (-adj_exp))
+
+        values.append(v)
+
+    fp["DynastyValue"] = values
+    return fp
+
+# ---------- Sleeper league data ----------
+
+@st.cache_data(show_spinner=False)
+def fetch_league_data():
+    league = fetch_json(f"{SLEEPER_API_BASE}/league/{SLEEPER_LEAGUE_ID}")
+    users = fetch_json(f"{SLEEPER_API_BASE}/league/{SLEEPER_LEAGUE_ID}/users")
+    rosters = fetch_json(f"{SLEEPER_API_BASE}/league/{SLEEPER_LEAGUE_ID}/rosters")
+    players_meta = fetch_json(f"{SLEEPER_API_BASE}/players/nfl")
+    traded = fetch_json(f"{SLEEPER_API_BASE}/league/{SLEEPER_LEAGUE_ID}/traded_picks")
+    return league, users, rosters, players_meta, traded
+
+def build_team_frames(fp_players):
+    league, users, rosters, players_meta, traded = fetch_league_data()
+
+    user_map = {}
+    for u in users:
+        display = u.get("metadata", {}).get("team_name") or u.get("display_name") or u.get("username")
+        avatar = u.get("avatar")
+        user_map[u["user_id"]] = {
+            "team_name": display,
+            "avatar": avatar,
         }
 
-    resultA = side_value(teamA, A_get_players, A_get_picks)
-    resultB = side_value(teamB, B_get_players, B_get_picks)
+    rows = []
+    for r in rosters:
+        rid = r["roster_id"]
+        owner_id = r.get("owner_id")
+        settings = r.get("settings", {}) or {}
+        wins = settings.get("wins", 0)
+        losses = settings.get("losses", 0)
+        ties = settings.get("ties", 0)
+        points_for = settings.get("fpts", 0) + settings.get("fpts_decimal", 0) / 100.0
 
-    totalA = resultA["after_package"]
-    totalB = resultB["after_package"]
+        meta = user_map.get(owner_id, {"team_name": f"Team {rid}", "avatar": None})
+        team_name = meta["team_name"]
+        avatar = meta["avatar"]
 
-    # Small guard to avoid division by zero
-    bigger = max(totalA, totalB, 1.0)
-    diff = totalA - totalB
-    pct = diff / bigger
+        for pid in r.get("players", []) or []:
+            p = players_meta.get(pid) or {}
+            full_name = p.get("full_name") or (p.get("first_name", "") + " " + p.get("last_name", ""))
+            pos = p.get("position", "")
+            name_key = canon_name(full_name)
+            match = fp_players.loc[fp_players["name_key"] == name_key]
+            if match.empty:
+                continue
+            mrow = match.sort_values("Rank").iloc[0]
+            rows.append(
+                {
+                    "sleeper_id": pid,
+                    "SleeperName": full_name,
+                    "Pos": pos or mrow["Pos"],
+                    "TeamName": team_name,
+                    "RosterID": rid,
+                    "OwnerID": owner_id,
+                    "avatar": avatar,
+                    "FP_Player": mrow["Player"],
+                    "Rank": mrow["Rank"],
+                    "DynastyValue": mrow["DynastyValue"],
+                    "Age": mrow.get("Age", np.nan),
+                }
+            )
 
-    st.markdown("---")
-    st.subheader("Trade Value Summary")
+    team_df = pd.DataFrame(rows)
+    if team_df.empty:
+        return team_df, pd.DataFrame(), {}, league
 
-    m1, m2, m3 = st.columns(3)
-    with m1:
-        st.metric(
-            f"{teamA} total value received",
-            f"{totalA:,.0f}",
-            help="Higher number = more dynasty value coming in."
+    team_strength = (
+        team_df.groupby(["RosterID", "TeamName"])
+        .agg(TotalValue=("DynastyValue", "sum"))
+        .reset_index()
+    )
+
+    rec_rows = []
+    for r in rosters:
+        rid = r["roster_id"]
+        settings = r.get("settings", {}) or {}
+        wins = settings.get("wins", 0)
+        losses = settings.get("losses", 0)
+        ties = settings.get("ties", 0)
+        points_for = settings.get("fpts", 0) + settings.get("fpts_decimal", 0) / 100.0
+        rec_rows.append(
+            {
+                "RosterID": rid,
+                "Wins": wins,
+                "Losses": losses,
+                "Ties": ties,
+                "PointsFor": points_for,
+            }
         )
-    with m2:
-        st.metric(
-            f"{teamB} total value received",
-            f"{totalB:,.0f}",
-            help="Higher number = more dynasty value coming in."
-        )
-    with m3:
-        st.metric(
-            "Value gap",
-            f"{abs(diff):,.0f}",
-            help="Difference between what each side receives (after roster context and 2-for-1 tax)."
-        )
+    rec_df = pd.DataFrame(rec_rows)
+    team_strength = team_strength.merge(rec_df, on="RosterID", how="left")
 
-    st.markdown("#### Fairness verdict")
+    team_strength["Power"] = (
+        team_strength["TotalValue"] * 0.65
+        + team_strength["PointsFor"].fillna(0) * 0.25
+        + team_strength["Wins"].fillna(0) * 0.10
+    )
+    team_strength = team_strength.sort_values("Power", ascending=False).reset_index(drop=True)
+    team_strength["LeagueRank"] = np.arange(1, len(team_strength) + 1)
 
-    if not A_get_players and not B_get_players and not A_get_picks and not B_get_picks:
-        st.info("Select some players or picks on each side to evaluate a trade.")
+    total_teams = len(team_strength)
+    slot_map = {}
+    for _, row in team_strength.iterrows():
+        rid = row["RosterID"]
+        rank = row["LeagueRank"]
+        slot = total_teams - rank + 1
+        slot_map[rid] = slot
+
+    # compute current pick owners from traded_picks
+    pick_owner = {}
+    for season in FUTURE_PICK_SEASONS:
+        for rnd in PICK_ROUNDS:
+            for r in rosters:
+                rid = r["roster_id"]
+                pick_owner[(season, rnd, rid)] = rid
+
+    for t in traded:
+        try:
+            season = int(t.get("season"))
+        except Exception:
+            continue
+        if season not in FUTURE_PICK_SEASONS:
+            continue
+        rnd = t.get("round")
+        if rnd not in PICK_ROUNDS:
+            continue
+        orig = t.get("roster_id")
+        owner = t.get("owner_id")
+        if orig is None or owner is None:
+            continue
+        pick_owner[(season, rnd, orig)] = owner
+
+    return team_df, team_strength, pick_owner, league
+
+# ---------- Value & pick helpers ----------
+
+def team_pick_list(roster_id, pick_owner, team_strength):
+    """Return list of tuples (season, rnd, orig_rid, label) for picks this roster currently owns."""
+    picks = []
+    for (season, rnd, orig_rid), owner_rid in pick_owner.items():
+        if owner_rid == roster_id:
+            if rnd == 1:
+                suffix = "1st"
+            elif rnd == 2:
+                suffix = "2nd"
+            elif rnd == 3:
+                suffix = "3rd"
+            else:
+                suffix = f"{rnd}th"
+            label = f"{season} {suffix}"
+            picks.append((season, rnd, orig_rid, label))
+    picks.sort(key=lambda x: (x[0], x[1]))
+    return picks
+
+def pick_value_numeric(season, rnd, orig_roster_id, team_strength):
+    """
+    Simple curve:
+    - Early 1sts ~= premium stud.
+    - Drops by round and by projected finish of original owner.
+    """
+    ts = team_strength.set_index("RosterID")
+    total_teams = len(ts)
+    if orig_roster_id in ts.index:
+        league_rank = ts.loc[orig_roster_id, "LeagueRank"]  # 1 = strongest
+        slot = total_teams - league_rank + 1  # worst team => slot 1
     else:
-        # Interpret fairness more gently
-        abs_pct = abs(pct)
+        slot = total_teams / 2.0
 
-        if abs_pct < 0.08:
-            verdict = "This looks **very close** in value."
-        elif abs_pct < 0.18:
-            verdict = "This trade **slightly favors** one side."
-        elif abs_pct < 0.35:
-            verdict = "This trade **meaningfully leans** to one side."
-        else:
-            verdict = "This trade **strongly leans** to one side."
+    overall_index = (rnd - 1) * total_teams + slot
+    base = 420.0
+    round_factor = {1: 1.0, 2: 0.55, 3: 0.30, 4: 0.15}.get(rnd, 0.1)
+    decay = 0.12
+    val = base * round_factor * np.exp(-decay * (overall_index - 1))
+    return float(val)
 
-        if diff > 0:
-            favored = teamA
-            other = teamB
-        elif diff < 0:
-            favored = teamB
-            other = teamA
-        else:
-            favored = None
-            other = None
+def side_package_value(player_ids, pick_labels, roster_id, team_df, pick_owner, team_strength, need_weight=0.3, picks_weight=1.0):
+    """Compute numeric value for a side of trade."""
+    if team_df.empty:
+        return 0.0, []
 
-        if favored is None:
-            st.success(
-                f"{verdict} The values are almost identical once we factor in rankings, picks, "
-                "roster context, and 2-for-1 tax."
-            )
-        else:
-            st.warning(
-                f"{verdict} It **likely favors {favored}** by about {abs(diff):,.0f} points "
-                f"(~{abs_pct:,.1%} of the side getting more value).\n\n"
-                "Remember: this is just a model. League-mates might value youth, risk, or "
-                "positional scarcity differently."
-            )
+    team_players = team_df.set_index("sleeper_id")
+    details = []
 
-        # Explain what "points" mean
-        st.caption(
-            "_These 'points' are a synthetic dynasty value scale built from FantasyPros "
-            "rankings + historical scoring curves. The percentage tells you roughly how "
-            "far apart the two sides are relative to the bigger side._"
+    base_val = 0.0
+    need_adj_val = 0.0
+
+    team_rows = team_df[team_df["RosterID"] == roster_id]
+    pos_counts = team_rows["Pos"].value_counts().to_dict()
+
+    def need_multiplier(pos, counts):
+        target = {"QB": 2, "RB": 5, "WR": 6, "TE": 2}.get(pos, 3)
+        current = counts.get(pos, 0)
+        diff = current - target
+        if diff <= -2:
+            return 1.10
+        if diff == -1:
+            return 1.05
+        if diff == 0:
+            return 1.0
+        if diff == 1:
+            return 0.96
+        return 0.92
+
+    # players
+    for pid in player_ids:
+        if pid not in team_players.index:
+            continue
+        row = team_players.loc[pid]
+        p_base = float(row["DynastyValue"])
+        base_val += p_base
+        mult = need_multiplier(row["Pos"], pos_counts)
+        adj = p_base * mult
+        need_adj_val += adj
+        details.append(
+            {
+                "kind": "player",
+                "name": row["SleeperName"],
+                "pos": row["Pos"],
+                "fp_rank": int(row["Rank"]),
+                "base": p_base,
+                "need_mult": mult,
+                "adj": adj,
+            }
         )
 
-    # ----------------- Detailed breakdown -----------------
-    with st.expander("Player-by-player breakdown (FantasyPros rank & value)"):
-        rows = []
-
-        def add_side(team_name, players, picks, label):
-            for p in players:
-                r, pos, v = get_player_rank_pos(p)
-                rows.append({
-                    "Side": label,
-                    "Team": team_name,
-                    "Asset": p,
-                    "Type": "Player",
-                    "Pos": pos,
-                    "FP Rank": None if r is None else int(round(r)),
-                    "Value": v,
-                })
-            for pk in picks:
-                rows.append({
-                    "Side": label,
-                    "Team": team_name,
-                    "Asset": pk,
-                    "Type": "Pick",
-                    "Pos": "",
-                    "FP Rank": None,
-                    "Value": pick_value(pk),
-                })
-
-        add_side(teamA, A_get_players, A_get_picks, f"{teamA} receives")
-        add_side(teamB, B_get_players, B_get_picks, f"{teamB} receives")
-
-        if rows:
-            df_detail = pd.DataFrame(rows)
-            st.dataframe(
-                df_detail.sort_values(["Side", "Type", "Value"], ascending=[True, True, False]),
-                use_container_width=True,
-            )
+    # picks
+    for label in pick_labels:
+        label = str(label).strip()
+        parts = label.split()
+        if len(parts) != 2:
+            continue
+        season_s, round_s = parts
+        try:
+            season = int(season_s)
+        except Exception:
+            continue
+        try:
+            rnd = int(round_s[0])
+        except Exception:
+            continue
+        orig_ids = [orig for (s, r, orig), owner in pick_owner.items() if s == season and r == rnd and owner == roster_id]
+        if not orig_ids:
+            orig = None
         else:
-            st.write("No assets selected yet.")
-
-    with st.expander("Roster context (why someone might like or dislike this trade)"):
-        def roster_context(team_name, incoming_players, incoming_picks, result):
-            st.markdown(f"**{team_name}**")
-
-            counts = team_pos_counts(team_name)
-            age_prof = team_age_profile(team_name)
-
-            bullets = []
-
-            for pos in ["QB", "RB", "WR", "TE"]:
-                cnt = counts.get(pos, 0)
-                tgt = DEFAULT_TARGETS.get(pos, 0)
-                if cnt < tgt - 1:
-                    bullets.append(f"- Light at **{pos}** ({cnt} on roster, target {tgt}).")
-                elif cnt > tgt + 1:
-                    bullets.append(f"- Already pretty deep at **{pos}** ({cnt} on roster).")
-
-            if age_prof:
-                for pos, avg_age in age_prof.items():
-                    if avg_age >= 28:
-                        bullets.append(f"- {pos} room is **veteran-heavy** (avg age ~{avg_age:.1f}).")
-                    elif avg_age <= 24:
-                        bullets.append(f"- {pos} room is **very young** (avg age ~{avg_age:.1f}).")
-
-            if records_live is not None and not records_live.empty:
-                rec_row = records_live.loc[records_live["Team"] == team_name]
-                if not rec_row.empty:
-                    w = int(rec_row["Wins"].iloc[0])
-                    l = int(rec_row["Losses"].iloc[0])
-                    bullets.append(f"- Current record: **{w}-{l}**.")
-
-            if incoming_players:
-                bullets.append(
-                    f"- Incoming players: {', '.join(incoming_players)}."
-                )
-
-            need_details = [d for d in result["need_details"] if d[3]]
-            for p, pos, mult, reason in need_details:
-                bullets.append(f"- {reason} (multiplier ~{mult:.2f}).")
-
-            if incoming_picks:
-                bullets.append(
-                    "- Incoming picks add some flexibility (future trades, rookie swings). "
-                    "Earlier picks for weaker/or rebuilding teams will naturally be valued a bit more."
-                )
-
-            if bullets:
-                for b in bullets:
-                    st.write(b)
-            else:
-                st.write(
-                    "Neither team has obvious positional red flags in this deal. At that point, "
-                    "it often comes down to personal preference, age windows, and risk tolerance."
-                )
-
-        roster_context(teamA, A_get_players, A_get_picks, resultA)
-        st.markdown("---")
-        roster_context(teamB, B_get_players, B_get_picks, resultB)
-
-    # --------------- Suggest tweaks section ---------------
-    with st.expander("Suggestions to help balance the trade"):
-        if not A_get_players and not B_get_players and not A_get_picks and not B_get_picks:
-            st.write("Once you build a trade, this section will suggest simple tweaks (like adding a pick).")
-        else:
-            if abs(diff) < 0.05 * bigger:
-                st.write("This is already quite close. Small tweaks (like swapping a minor depth piece) may be enough if someone is uneasy.")
-            else:
-                if diff > 0:
-                    winning_team = teamA
-                    losing_team = teamB
-                    losing_picks = picksB
-                    losing_players = players_B
-                    target_gap = diff
-                else:
-                    winning_team = teamB
-                    losing_team = teamA
-                    losing_picks = picksA
-                    losing_players = players_A
-                    target_gap = -diff
-
-                st.markdown(
-                    f"- Right now, **{winning_team}** is getting the better side.\n"
-                    f"- To make things feel more even, **{losing_team}** could consider adding something small."
-                )
-
-                # simple suggestion: add the smallest reasonable pick or depth player
-                candidates = []
-
-                for pk in losing_picks:
-                    v = pick_value(pk)
-                    if v > 0:
-                        candidates.append(("Pick", pk, v))
-
-                for p in losing_players:
-                    v = get_player_value(p)
-                    if 0 < v < target_gap * 1.5:
-                        candidates.append(("Player", p, v))
-
-                candidates = sorted(candidates, key=lambda x: x[2])
-
-                if not candidates:
-                    st.write(
-                        "It's hard to find an obvious small add from the losing side. "
-                        "You may need to re-shape the core pieces of the deal instead."
-                    )
-                else:
-                    best = candidates[0]
-                    kind, asset, v = best
-                    st.write(
-                        f"- A simple option: **{losing_team}** adds {asset} "
-                        f"(rough value ~{v:,.0f}). That would pull the values much closer."
-                    )
-
-
-# ====================================================
-# TRADE FINDER TAB
-# ====================================================
-
-with tab_finder:
-    st.markdown("### Trade Finder")
-
-    st.write(
-        "Pick a player you want to acquire, and we'll search your roster + your picks "
-        "for packages that land roughly in the right value range."
-    )
-
-    col1, col2 = st.columns(2)
-    with col1:
-        your_team = st.selectbox("Your team", teams, key="finder_your_team")
-    with col2:
-        other_team = st.selectbox(
-            "Team you're trading with",
-            [t for t in teams if t != your_team],
-            key="finder_other_team",
+            orig = orig_ids[0]
+        pv = pick_value_numeric(season, rnd, orig, team_strength)
+        base_val += pv
+        need_adj_val += pv * picks_weight
+        details.append(
+            {
+                "kind": "pick",
+                "name": label,
+                "pos": "PICK",
+                "fp_rank": None,
+                "base": pv,
+                "need_mult": picks_weight,
+                "adj": pv * picks_weight,
+            }
         )
 
-    other_players = sorted(
-        rosters.loc[rosters["Team"] == other_team, "Player"].unique().tolist()
-    )
+    blended = (1 - need_weight) * base_val + need_weight * need_adj_val
+    return blended, details
 
-    target_player = st.selectbox(
-        f"Player on {other_team} you want",
-        other_players,
-        key="finder_target_player",
-    )
+def format_value_gap(a_val, b_val, teamA_name, teamB_name):
+    diff = a_val - b_val
+    bigger = max(a_val, b_val, 1e-6)
+    pct = abs(diff) / bigger
 
-    your_players = sorted(
-        rosters.loc[rosters["Team"] == your_team, "Player"].unique().tolist()
-    )
-    your_picks = sorted(picks_by_team_live.get(your_team, []))
+    if abs(diff) < bigger * 0.05:
+        verdict = "This looks close to even."
+    elif diff > 0:
+        verdict = f"This trade likely leans toward {teamA_name}."
+    else:
+        verdict = f"This trade likely leans toward {teamB_name}."
 
-    max_assets = st.slider(
-        "Max number of assets you want to send (players + picks)",
-        1,
-        4,
-        3,
-    )
+    explain = f"The gap between the two sides is about **{pct*100:.1f}%** when we compare total value.\n"
+    explain += "Because trades are subjective, managers might still disagree depending on their window, risk tolerance, and how they personally view the players."
+    return verdict, diff, pct, explain
 
-    if st.button("Suggest a trade package"):
-        # value of target
-        target_val = get_player_value(target_player)
+def summarise_roster_context(team_df, roster_id, incoming_details, outgoing_details):
+    team_rows = team_df[team_df["RosterID"] == roster_id]
+    if team_rows.empty:
+        return "We don't have enough roster data here."
 
-        if target_val <= 0:
-            st.warning(
-                "Couldn't find a solid value for that player (maybe missing from rankings)."
+    counts = team_rows["Pos"].value_counts().to_dict()
+
+    def pos_list(details, kind):
+        return [d for d in details if d["kind"] == kind]
+
+    inc_players = pos_list(incoming_details, "player")
+    out_players = pos_list(outgoing_details, "player")
+
+    notes = []
+
+    for pos in ["QB", "RB", "WR", "TE"]:
+        before = counts.get(pos, 0)
+        delta = sum(1 for d in inc_players if d["pos"] == pos) - sum(1 for d in out_players if d["pos"] == pos)
+        after = before + delta
+        if before <= 1 and delta < 0:
+            notes.append(f"They'd be pretty thin at **{pos}** after this deal (around {after} on the roster).")
+        elif before <= 2 and pos in ["QB", "RB"] and delta < 0:
+            notes.append(f"This would noticeably weaken their **{pos}** depth (down to about {after}).")
+        elif before >= 4 and delta > 0 and pos in ["RB", "WR"]:
+            notes.append(f"They already have plenty of **{pos}**; adding more here is probably a luxury rather than a necessity.")
+
+    if not notes:
+        notes.append("Neither side creates an obvious positional issue. Whether they accept may come down to how they feel about these specific players and their competitive window.")
+
+    return " ".join(notes)
+
+def build_piece_table(details):
+    rows = []
+    for d in details:
+        if d["kind"] == "player":
+            rows.append(
+                {
+                    "Piece": d["name"],
+                    "Pos": d["pos"],
+                    "FP Rank": d["fp_rank"],
+                    "Base Value": round(d["base"]),
+                    "Need/Pick Mult": round(d["need_mult"], 2),
+                    "Adjusted Value": round(d["adj"]),
+                }
             )
         else:
-            st.write(
-                f"Estimated value for **{target_player}**: ~{target_val:,.0f} points."
+            rows.append(
+                {
+                    "Piece": d["name"],
+                    "Pos": "PICK",
+                    "FP Rank": "",
+                    "Base Value": round(d["base"]),
+                    "Need/Pick Mult": round(d["need_mult"], 2),
+                    "Adjusted Value": round(d["adj"]),
+                }
             )
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    return df.sort_values("Adjusted Value", ascending=False)
 
-            # build list of your tradable assets
-            assets = []
-            for p in your_players:
-                v = get_player_value(p)
-                if v > 0:
-                    assets.append(("Player", p, v))
-            for pk in your_picks:
-                v = pick_value(pk)
-                if v > 0:
-                    assets.append(("Pick", pk, v))
+# ---------- UI ----------
 
-            # only consider top N assets to keep search manageable
-            assets = sorted(assets, key=lambda x: x[2], reverse=True)[:18]
+players_fp = build_player_pool()
+if players_fp.empty:
+    st.error("Couldn't load FantasyPros rankings. Try again later.")
+    st.stop()
 
-            best_candidates = []
+team_df, team_strength, pick_owner, league = build_team_frames(players_fp)
 
-            for r in range(1, max_assets + 1):
-                for combo in combinations(assets, r):
-                    total = sum(x[2] for x in combo)
-                    # apply package penalty as if they all go in one side
-                    total_after = apply_package_penalty(total, len(combo))
-
-                    # we want something in ~90%–120% of target value
-                    if 0.90 * target_val <= total_after <= 1.20 * target_val:
-                        best_candidates.append((combo, total_after))
-
-            if not best_candidates:
-                st.info(
-                    "I couldn't find a simple package in that range. "
-                    "You may need to involve a core piece or accept a bigger overpay/underpay."
-                )
-            else:
-                # shuffle for variety, then show a few
-                random.shuffle(best_candidates)
-                best_candidates = sorted(best_candidates, key=lambda x: abs(x[1] - target_val))
-
-                st.markdown("#### Suggested packages (you send this to get your target)")
-
-                for i, (combo, total_after) in enumerate(best_candidates[:3], start=1):
-                    player_list = [a[1] for a in combo if a[0] == "Player"]
-                    pick_list = [a[1] for a in combo if a[0] == "Pick"]
-                    st.markdown(f"**Option {i}** — approx value ~{total_after:,.0f}")
-
-                    if player_list:
-                        st.write("- Players: " + ", ".join(player_list))
-                    if pick_list:
-                        st.write("- Picks: " + ", ".join(pick_list))
-
-                    gap = total_after - target_val
-                    pct_gap = gap / max(total_after, target_val)
-                    if abs(pct_gap) < 0.08:
-                        st.caption("Pretty close in value; a reasonable starting point.")
-                    elif pct_gap > 0:
-                        st.caption(
-                            "Slight overpay on your side — you might ask for a small add-back "
-                            "from the other manager."
-                        )
-                    else:
-                        st.caption(
-                            "Slight underpay — depending on how much they like your pieces, "
-                            "they might still consider it."
-                        )
-
-# ============================
-# Footer: how this is built
-# ============================
-
-st.markdown("---")
 st.markdown(
-    "_This tool blends FantasyPros Dynasty Superflex PPR rankings with historical PPR "
-    "scoring curves and live Sleeper league data (rosters, records, and traded picks). "
-    "Values are **guides**, not absolute truths — your league-mates may weigh age, risk, "
-    "and positional scarcity differently._"
+    "### Dynasty Bros. Trade Calculator\n"
+    "*Powered by FantasyPros' latest **Dynasty Superflex PPR** rankings and live Sleeper league data.*"
 )
+st.caption(
+    "Player values are built off FantasyPros dynasty superflex ranks, then adjusted by position, last-season PPR scoring curves, team needs, "
+    "and projected draft pick strength. Treat this as a guide — not a guarantee."
+)
+
+with st.sidebar:
+    st.subheader("How should we view this trade?")
+    rank_slider = st.slider(
+        "Weight on FantasyPros rank",
+        0.5,
+        1.5,
+        1.0,
+        0.05,
+        help="Higher = rankings matter more. Lower = things like team needs and picks matter a bit more."
+    )
+    need_slider = st.slider(
+        "Weight on roster needs",
+        0.0,
+        1.0,
+        0.30,
+        0.05,
+        help="How much to nudge values based on how many QBs/RBs/WRs/TEs each team already has. This always stays a smaller factor than rank."
+    )
+    pick_slider = st.slider(
+        "Weight on future picks",
+        0.5,
+        1.5,
+        1.0,
+        0.05,
+        help="Higher = future picks get a bit more credit vs current players. Lower = more win-now focused."
+    )
+
+tabs = st.tabs(["Trade Calculator", "Trade Finder", "League / Data Overview"])
+tab_calc, tab_find, tab_overview = tabs
+
+team_list = (
+    team_strength.sort_values("TeamName")["TeamName"].tolist()
+    if not team_strength.empty
+    else sorted(team_df["TeamName"].unique().tolist())
+)
+
+name_to_roster = {}
+for _, row in team_strength.iterrows():
+    name_to_roster[row["TeamName"]] = row["RosterID"]
+
+# ---------- Trade Calculator ----------
+
+with tab_calc:
+    st.subheader("Trade Calculator")
+
+    if team_df.empty or team_strength.empty:
+        st.warning("Couldn't load Sleeper league data. Team-specific features will be limited.")
+    else:
+        colA, colB = st.columns(2)
+        with colA:
+            teamA = st.selectbox("Team A", team_list, index=0)
+        with colB:
+            teamB = st.selectbox("Team B", team_list, index=min(1, len(team_list) - 1))
+
+        ridA = name_to_roster.get(teamA)
+        ridB = name_to_roster.get(teamB)
+
+        rosterA = team_df[team_df["RosterID"] == ridA].sort_values("SleeperName")
+        rosterB = team_df[team_df["RosterID"] == ridB].sort_values("SleeperName")
+
+        A_players = st.multiselect(
+            f"{teamA} sends players",
+            options=rosterA["SleeperName"].tolist(),
+            default=[],
+        )
+        A_picks_list = team_pick_list(ridA, pick_owner, team_strength)
+        A_pick_labels = [p[3] for p in A_picks_list]
+        A_picks = st.multiselect(
+            f"{teamA} sends picks",
+            options=A_pick_labels,
+            default=[],
+        )
+
+        B_players = st.multiselect(
+            f"{teamB} sends players",
+            options=rosterB["SleeperName"].tolist(),
+            default=[],
+        )
+        B_picks_list = team_pick_list(ridB, pick_owner, team_strength)
+        B_pick_labels = [p[3] for p in B_picks_list]
+        B_picks = st.multiselect(
+            f"{teamB} sends picks",
+            options=B_pick_labels,
+            default=[],
+        )
+
+        def ids_from_names(roster_df, names):
+            sub = roster_df[roster_df["SleeperName"].isin(names)]
+            return sub["sleeper_id"].tolist()
+
+        A_player_ids = ids_from_names(rosterA, A_players)
+        B_player_ids = ids_from_names(rosterB, B_players)
+
+        A_out_val, A_out_det = side_package_value(
+            A_player_ids,
+            A_picks,
+            ridA,
+            team_df,
+            pick_owner,
+            team_strength,
+            need_weight=need_slider,
+            picks_weight=pick_slider,
+        )
+        A_in_val, A_in_det = side_package_value(
+            B_player_ids,
+            B_picks,
+            ridA,
+            team_df,
+            pick_owner,
+            team_strength,
+            need_weight=need_slider,
+            picks_weight=pick_slider,
+        )
+        B_out_val, B_out_det = side_package_value(
+            B_player_ids,
+            B_picks,
+            ridB,
+            team_df,
+            pick_owner,
+            team_strength,
+            need_weight=need_slider,
+            picks_weight=pick_slider,
+        )
+        B_in_val, B_in_det = side_package_value(
+            A_player_ids,
+            A_picks,
+            ridB,
+            team_df,
+            pick_owner,
+            team_strength,
+            need_weight=need_slider,
+            picks_weight=pick_slider,
+        )
+
+        # rank emphasis
+        A_out_val *= rank_slider
+        A_in_val *= rank_slider
+        B_out_val *= rank_slider
+        B_in_val *= rank_slider
+
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric(f"{teamA} sends", f"{A_out_val:,.0f}")
+        col2.metric(f"{teamA} receives", f"{A_in_val:,.0f}")
+        col3.metric(f"{teamB} sends", f"{B_out_val:,.0f}")
+        col4.metric(f"{teamB} receives", f"{B_in_val:,.0f}")
+
+        st.markdown("---")
+        st.subheader("Fairness verdict")
+
+        verdict, diff, pct, expl = format_value_gap(A_in_val, B_in_val, teamA, teamB)
+
+        if abs(diff) < max(A_in_val, B_in_val, 1.0) * 0.05:
+            st.info(f"Trade looks roughly balanced. {expl}")
+        elif diff > 0:
+            st.info(
+                f"**Trade leans toward {teamA}.**\n\n"
+                f"{teamA} is receiving about **{abs(diff):,.0f} more value points**, "
+                f"which is roughly **{pct*100:.1f}%** of the larger side.\n\n{expl}"
+            )
+        else:
+            st.info(
+                f"**Trade leans toward {teamB}.**\n\n"
+                f"{teamB} is receiving about **{abs(diff):,.0f} more value points**, "
+                f"which is roughly **{pct*100:.1f}%** of the larger side.\n\n{expl}"
+            )
+
+        st.markdown("#### Roster context (why a manager might like or hesitate)")
+        ctxA = summarise_roster_context(team_df, ridA, A_in_det, A_out_det)
+        ctxB = summarise_roster_context(team_df, ridB, B_in_det, B_out_det)
+        st.markdown(f"**{teamA} perspective:** {ctxA}")
+        st.markdown(f"**{teamB} perspective:** {ctxB}")
+
+        with st.expander("See the pieces, ranks, and values we used"):
+            st.markdown(f"**What {teamA} receives**")
+            dfA = build_piece_table(A_in_det)
+            if not dfA.empty:
+                st.table(dfA)
+            else:
+                st.write("No players or picks selected for this side.")
+            st.markdown(f"**What {teamB} receives**")
+            dfB = build_piece_table(B_in_det)
+            if not dfB.empty:
+                st.table(dfB)
+            else:
+                st.write("No players or picks selected for this side.")
+
+# ---------- Trade Finder ----------
+
+with tab_find:
+    st.subheader("Trade Finder (beta)")
+
+    if team_df.empty or team_strength.empty:
+        st.warning("Need live Sleeper data to suggest trades. Try again later.")
+    else:
+        col1, col2 = st.columns(2)
+        with col1:
+            wanting_team = st.selectbox("Team that wants to acquire a player", team_list, key="tf_team")
+        with col2:
+            target_player_name = st.selectbox(
+                "Player they want",
+                sorted(team_df["SleeperName"].unique().tolist()),
+                key="tf_target",
+            )
+
+        wanting_rid = name_to_roster.get(wanting_team)
+        target_row = team_df[team_df["SleeperName"] == target_player_name]
+        if target_row.empty:
+            st.info("Pick a player to get started.")
+        else:
+            target_row = target_row.iloc[0]
+            target_owner_id = target_row["RosterID"]
+            target_team_name = team_strength.loc[team_strength["RosterID"] == target_owner_id, "TeamName"].iloc[0]
+
+            st.markdown(
+                f"{wanting_team} is trying to acquire **{target_player_name} ({target_row['Pos']})**, "
+                f"currently on **{target_team_name}**."
+            )
+
+            offer_roster = team_df[team_df["RosterID"] == wanting_rid].sort_values("SleeperName")
+            offer_picks = team_pick_list(wanting_rid, pick_owner, team_strength)
+            offer_pick_labels = [p[3] for p in offer_picks]
+
+            # target value
+            target_val, _ = side_package_value(
+                [target_row["sleeper_id"]],
+                [],
+                target_owner_id,
+                team_df,
+                pick_owner,
+                team_strength,
+                need_weight=need_slider,
+                picks_weight=pick_slider,
+            )
+            target_val *= rank_slider
+
+            # candidate players from offering team
+            pvals = []
+            for _, row in offer_roster.iterrows():
+                pid = row["sleeper_id"]
+                if pid == target_row["sleeper_id"]:
+                    continue
+                val, _ = side_package_value(
+                    [pid],
+                    [],
+                    wanting_rid,
+                    team_df,
+                    pick_owner,
+                    team_strength,
+                    need_weight=need_slider,
+                    picks_weight=pick_slider,
+                )
+                val *= rank_slider
+                pvals.append((pid, row["SleeperName"], row["Pos"], val))
+            pvals.sort(key=lambda x: x[3], reverse=True)
+
+            suggestions = []
+
+            # 1-for-1 offers near target value
+            for pid, name, pos, val in pvals[:12]:
+                gap = abs(val - target_val)
+                if gap <= target_val * 0.20:
+                    suggestions.append(
+                        {
+                            "players_out": [name],
+                            "picks_out": [],
+                            "value_out": val,
+                            "desc": f"{wanting_team} sends **{name} ({pos})**.",
+                            "gap": gap,
+                        }
+                    )
+
+            # player + pick combos
+            for pid, name, pos, val in pvals[:8]:
+                for label in offer_pick_labels[:6]:
+                    val2, _ = side_package_value(
+                        [pid],
+                        [label],
+                        wanting_rid,
+                        team_df,
+                        pick_owner,
+                        team_strength,
+                        need_weight=need_slider,
+                        picks_weight=pick_slider,
+                    )
+                    val2 *= rank_slider
+                    gap = abs(val2 - target_val)
+                    if gap <= target_val * 0.20:
+                        suggestions.append(
+                            {
+                                "players_out": [name],
+                                "picks_out": [label],
+                                "value_out": val2,
+                                "desc": f"{wanting_team} sends **{name} ({pos})** and **{label}**.",
+                                "gap": gap,
+                            }
+                        )
+
+            suggestions.sort(key=lambda x: x["gap"])
+            if not suggestions:
+                # if nothing is close, show a few best approximate options
+                for pid, name, pos, val in pvals[:3]:
+                    suggestions.append(
+                        {
+                            "players_out": [name],
+                            "picks_out": [],
+                            "value_out": val,
+                            "desc": f"{wanting_team} sends **{name} ({pos})**.",
+                            "gap": abs(val - target_val),
+                        }
+                    )
+                suggestions.sort(key=lambda x: x["gap"])
+
+            max_show = min(5, len(suggestions))
+            st.markdown("##### Suggested offers")
+            st.caption(
+                "These are based on our value model. Real managers might ask for a bit more or less depending on their timelines and preferences."
+            )
+
+            for i in range(max_show):
+                s = suggestions[i]
+                st.markdown(
+                    f"**Option {i+1}:** {s['desc']}  \n"
+                    f"Approximate package value: **{s['value_out']:,.0f}** vs. target's **{target_val:,.0f}**."
+                )
+
+# ---------- Overview tab ----------
+
+with tab_overview:
+    st.subheader("League / Data Overview")
+    if not team_strength.empty:
+        st.markdown("**Team power rankings (by our value model)**")
+        show_cols = ["LeagueRank", "TeamName", "TotalValue", "Wins", "Losses", "PointsFor"]
+        st.dataframe(team_strength[show_cols].sort_values("LeagueRank"), use_container_width=True)
+
+    st.markdown("**Top 50 players by our value model**")
+    top_players = players_fp.sort_values("DynastyValue", ascending=False).head(50)
+    st.dataframe(
+        top_players[["Player", "Pos", "Rank", "Age", "DynastyValue"]],
+        use_container_width=True,
+    )
+
+    st.markdown(
+        "---\n"
+        "_Notes:_ Values are derived from FantasyPros dynasty superflex PPR ranks, smoothed using last-season PPR scoring by position, "
+        "and then lightly adjusted for roster context and projected draft pick strength. "
+        "They're meant to give you a structured starting point for trade talks, not a final answer."
+    )
