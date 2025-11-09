@@ -684,8 +684,9 @@ def tier_group(rank: float) -> str:
         return "Depth"
 
 players_df["TierGroup"] = players_df["Rank"].apply(tier_group)
+# Young flag: 24 years old or less
 players_df["IsYoung"] = players_df["Age"].apply(
-    lambda a: bool(not pd.isna(a) and a <= 26)
+    lambda a: bool(not pd.isna(a) and a <= 24)
 )
 
 # Team ages for pick context
@@ -1096,10 +1097,10 @@ def build_asset_lists_for_team(team):
 
 def matches_position_type(player_name: str, selection: str) -> bool:
     """
-    Filter by High-Tier / Starter / Flex / Depth / Young.
+    Filter by High-Tier / Starter / Flex / Depth / 24 years old or less.
 
-    If we *do* have age data, "Young" means Age <= 26.
-    If we *don't* have reliable age data (all NaN), we fall back to
+    If we *do* have age data, '24 years old or less' means Age <= 24.
+    If we *don't* have reliable age data, we fall back to
     using overall rank as a proxy for "young-ish, future-friendly assets".
     """
     if selection == "Any":
@@ -1111,7 +1112,7 @@ def matches_position_type(player_name: str, selection: str) -> bool:
     tier = r["TierGroup"].iloc[0]
     is_young_flag = bool(r["IsYoung"].iloc[0]) if "IsYoung" in r.columns else False
 
-    if selection == "Young":
+    if selection == "24 years old or less":
         # If we actually have age data, use it
         if "IsYoung" in players_df.columns and players_df["IsYoung"].any():
             return is_young_flag
@@ -1563,13 +1564,13 @@ with tab_finder:
 
         position_type_choice = st.selectbox(
             "Position type (optional)",
-            ["Any", "High-Tier", "Starter", "Flex", "Depth", "Young"],
+            ["Any", "High-Tier", "Starter", "Flex", "Depth", "24 years old or less"],
             help=(
                 "High-Tier: must-start level\n"
                 "Starter: usually in the lineup\n"
                 "Flex: could be in a flex spot\n"
                 "Depth: bench/injury fill-in\n"
-                "Young: age 26 or younger (independent of tier; or top ~120 overall if age data missing)"
+                "24 years old or less: age ≤ 24 (or roughly top-120 overall if age data is missing)"
             ),
         )
 
@@ -1686,52 +1687,61 @@ with tab_finder:
                     "Try broadening positions, relaxing pick rounds, or adjusting sliders."
                 )
             else:
-                # Sort by closeness and limit duplicate targets
+                # Sort by closeness and limit duplicate *players* in 'You Get'
                 suggestions_all.sort(key=lambda s: s["Approx value gap"])
                 filtered = []
-                target_counts = {}  # key = tuple(sorted(You Get)) -> how many times used
+                used_players = set()
+                player_name_set = set(players_df["Player"].tolist())
 
                 for s in suggestions_all:
-                    key = tuple(sorted(s["You Get"]))
-                    count = target_counts.get(key, 0)
-                    # At most 2 suggestions per unique target package
-                    if count >= 2:
+                    players_in_bundle = [
+                        asset for asset in s["You Get"] if asset in player_name_set
+                    ]
+                    # If any player in this suggested bundle has already been used, skip
+                    if any(p in used_players for p in players_in_bundle):
                         continue
+
                     filtered.append(s)
-                    target_counts[key] = count + 1
+                    used_players.update(players_in_bundle)
                     if len(filtered) >= 3:
                         break
 
-                st.markdown("### Suggested ideas")
-                for i, sug in enumerate(filtered, start=1):
-                    st.markdown(f"**Idea #{i}** — {sug['From']} ↔ {sug['To']}")
-                    st.write(
-                        f"{sug['From']} sends: "
-                        f"{', '.join(sug['You Send players']) or 'no players'}; "
-                        f"{', '.join(sug['You Send picks']) or 'no picks'}"
+                if not filtered:
+                    st.info(
+                        "Found some ideas, but they were too repetitive with the same player. "
+                        "Try tweaking filters or sliders."
                     )
-                    st.write(
-                        f"{sug['From']} receives: "
-                        f"{', '.join(sug['You Get'])}"
-                    )
+                else:
+                    st.markdown("### Suggested ideas")
+                    for i, sug in enumerate(filtered, start=1):
+                        st.markdown(f"**Idea #{i}** — {sug['From']} ↔ {sug['To']}")
+                        st.write(
+                            f"{sug['From']} sends: "
+                            f"{', '.join(sug['You Send players']) or 'no players'}; "
+                            f"{', '.join(sug['You Send picks']) or 'no picks'}"
+                        )
+                        st.write(
+                            f"{sug['From']} receives: "
+                            f"{', '.join(sug['You Get'])}"
+                        )
 
-                    recv_players = [
-                        asset
-                        for asset in sug["You Get"]
-                        if asset in set(players_df["Player"])
-                    ]
-                    recv_picks = [
-                        asset for asset in sug["You Get"] if asset not in recv_players
-                    ]
-                    expl = build_suggestion_explanation(
-                        sug["You Send players"],
-                        sug["You Send picks"],
-                        recv_players,
-                        recv_picks,
-                        sug["Approx value gap"],
-                    )
-                    st.write(expl)
-                    st.markdown("---")
+                        recv_players = [
+                            asset
+                            for asset in sug["You Get"]
+                            if asset in set(players_df["Player"])
+                        ]
+                        recv_picks = [
+                            asset for asset in sug["You Get"] if asset not in recv_players
+                        ]
+                        expl = build_suggestion_explanation(
+                            sug["You Send players"],
+                            sug["You Send picks"],
+                            recv_players,
+                            recv_picks,
+                            sug["Approx value gap"],
+                        )
+                        st.write(expl)
+                        st.markdown("---")
 
     else:  # Trade away mode
         st.markdown("**1) What are you open to trading away?**")
@@ -1801,8 +1811,8 @@ with tab_finder:
 st.markdown("---")
 st.caption(
     "This tool uses FantasyPros Dynasty Superflex PPR rankings + PPR scoring curves, "
-    "small adjustments for positional scarcity, age profiles, live Sleeper rosters, "
-    "and a light touch of team-need awareness. It's meant to flag trades that are "
+    "small adjustments for positional scarcity, age profiles (with a special look at players 24 and under), "
+    "live Sleeper rosters, and a light touch of team-need awareness. It's meant to flag trades that are "
     "way off or broadly reasonable — not to replace your own judgement."
 )
 
@@ -1813,8 +1823,8 @@ with st.expander("For more information, click here."):
 
 - **Rankings:** Uses the latest FantasyPros **Dynasty Superflex PPR** expert consensus.
 - **Scoring curves:** Looks at historical PPR scoring by position to understand how fast production falls off (for example, WR1 vs WR20).
-- **Age profiles:** Younger cores get a small bump; older players get a soft haircut, especially at RB.
-- **Positional tiers:** Each player is tagged as **High-Tier**, **Starter**, **Flex**, or **Depth** based on overall FantasyPros rank, plus a separate **Young (≤26)** flag.
+- **Age profiles:** Younger cores get a small bump; older players get a soft haircut, especially at RB. Players **24 years old or less** are marked as young assets when age data is available.
+- **Positional tiers:** Each player is tagged as **High-Tier**, **Starter**, **Flex**, or **Depth** based on overall FantasyPros rank, plus a separate flag for young players (24 or under).
 - **Positional scarcity:** Positions with fewer reliable options get a **small** premium, but not enough to make a depth TE more valuable than a truly premium WR or QB.
 - **Team needs:** Roster needs are a *minor* factor — helpful for tiebreakers, not something that overrides rankings.
 - **Picks:** Future picks are valued by:
@@ -1831,7 +1841,7 @@ with st.expander("For more information, click here."):
 - ✅ Smoothed player values so top-end options pull away more from mid-tier choices.
 - ✅ Added **trade categories** (Perfect Fit → Call the Commissioner) for quick gut checks.
 - ✅ Built a **Trade Finder** with two modes:
-  - “Acquire position/picks” to find ways to target specific spots or draft capital, now with filters for High-Tier / Starter / Flex / Depth / Young.
+  - “Acquire position/picks” to find ways to target specific spots or draft capital, now with filters for High-Tier / Starter / Flex / Depth / 24 years old or less.
   - “Trade away” to see what you could reasonably get back for a package.
 - ✅ Tweaked layouts for mobile, simplified the header, and combined context + details into one breakdown section.
 """
