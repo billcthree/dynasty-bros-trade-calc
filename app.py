@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 import requests
 from datetime import datetime
-from itertools import combinations
 import math
 import random
 
@@ -36,21 +35,7 @@ def normalize_name(name: str) -> str:
 
 @st.cache_data(show_spinner=False)
 def load_sleeper_league(league_id: str):
-    """Fetch rosters, records, and traded picks from Sleeper.
-
-    Returns
-    -------
-    rosters_df : DataFrame
-        Columns: Team, Player, Pos
-    records_df : DataFrame
-        Columns: Team, Wins, Losses, Ties
-    picks_by_team : dict
-        {current_owner_team: ["2026 R1 (OriginalTeam)", ...]}
-    pick_label_to_original : dict
-        {label: original_team_name}
-    future_years : list[int]
-        Seasons we built picks for (typically next 3).
-    """
+    """Fetch rosters, records, and traded picks from Sleeper."""
     base = f"https://api.sleeper.app/v1/league/{league_id}"
     league_info = requests.get(base, timeout=20).json()
     season = int(league_info.get("season", datetime.now().year))
@@ -471,8 +456,6 @@ if use_live and league_id.strip():
                 .rename(columns={"Pos_use": "Pos", "Rank_use": "Rank"})
             )
             rosters_df = roster_enriched[["Team", "Player"]].copy()
-            targets = DEFAULT_TARGETS
-            posmult = DEFAULT_POSMULT
 
         st.success("Loaded live Sleeper rosters + FantasyPros rankings.")
     except Exception as e:
@@ -511,9 +494,6 @@ if not use_live:
     records_df = (
         rosters_df[["Team"]].drop_duplicates().assign(Wins=0, Losses=0, Ties=0)
     )
-
-    targets = DEFAULT_TARGETS
-    posmult = DEFAULT_POSMULT
 
     current_year = datetime.now().year
     future_pick_years = [current_year + i for i in (1, 2, 3)]
@@ -561,12 +541,14 @@ for pos in ["QB", "RB", "WR", "TE"]:
     scarcity = 0.85 + (raw_clamped - 0.5) * (1.15 - 0.85) / (2.0 - 0.5)
     scarcity_mult[pos] = scarcity
 
+DEFAULT_POSMULT = {"QB": 1.10, "RB": 1.00, "WR": 1.00, "TE": 0.95}
+
 posmult_effective = {}
 for pos in ["QB", "RB", "WR", "TE"]:
     base_mult = DEFAULT_POSMULT.get(pos, 1.0)
     eff = base_mult * scarcity_mult.get(pos, 1.0)
     if pos == "TE":
-        eff = min(eff, 0.85)  # keep TEs definitely under WR/QB top-end options
+        eff = min(eff, 0.85)  # TEs kept safely below similarly ranked WR/QB
     posmult_effective[pos] = eff
 
 players_df["PosMult"] = players_df["Pos"].map(posmult_effective).fillna(1.0)
@@ -682,7 +664,6 @@ players_df["BaseValue"] = (
 ).round(2)
 
 # --------- Monotonic smoothing by overall rank ----------
-# Ensure better (lower) FantasyPros rank never has *less* value than worse rank
 players_df = players_df.sort_values("Rank").reset_index(drop=True)
 vals = players_df["BaseValue"].to_numpy()
 for i in range(1, len(vals)):
@@ -690,16 +671,22 @@ for i in range(1, len(vals)):
         vals[i] = vals[i - 1] * 0.999
 players_df["BaseValue"] = vals
 
-# Player tier labels for Trade Finder filters
-def tier_label(rank: float) -> str:
+# --------- Tier groups (for Trade Finder filters) ----------
+def tier_group(rank: float) -> str:
+    """Map overall FP rank to High-Tier / Starter / Flex / Depth."""
     if rank <= 36:
-        return "top tier"
+        return "High-Tier"
     elif rank <= 96:
-        return "mid-tier"
+        return "Starter"
+    elif rank <= 144:
+        return "Flex"
     else:
-        return "depth"
+        return "Depth"
 
-players_df["TierLabel"] = players_df["Rank"].apply(tier_label)
+players_df["TierGroup"] = players_df["Rank"].apply(tier_group)
+players_df["IsYoung"] = players_df["Age"].apply(
+    lambda a: bool(not pd.isna(a) and a <= 26)
+)
 
 # Team ages for pick context
 team_avg_age = {}
@@ -1001,7 +988,11 @@ def player_rank_blurb(name: str):
         return None
     pos = r["Pos"].iloc[0]
     rk = int(r["Rank"].iloc[0])
-    return f"{name} is around overall **#{rk}** as a **{pos}** in the FantasyPros dynasty superflex rankings."
+    tier = r["TierGroup"].iloc[0]
+    return (
+        f"{name} is around overall **#{rk}** as a **{pos} ({tier})** "
+        "in the FantasyPros dynasty superflex rankings."
+    )
 
 def build_suggestion_explanation(
     send_players, send_picks, recv_players, recv_picks, gap_pct
@@ -1063,7 +1054,7 @@ def build_suggestion_explanation(
     return " ".join(lines)
 
 # ====================================================
-# Trade finder helpers (simplified / faster)
+# Trade finder helpers
 # ====================================================
 
 def build_asset_lists_for_team(team):
@@ -1085,31 +1076,30 @@ def build_asset_lists_for_team(team):
     return player_vals, pick_vals
 
 def matches_position_type(player_name: str, selection: str) -> bool:
+    """Filter by High-Tier / Starter / Flex / Depth / Young."""
     if selection == "Any":
         return True
     r = players_df.loc[players_df["Player"] == player_name]
     if r.empty:
         return True
-    tier = r["TierLabel"].iloc[0]
-    age = r["Age"].iloc[0] if "Age" in r.columns else np.nan
+    tier = r["TierGroup"].iloc[0]
+    is_young = r["IsYoung"].iloc[0]
 
     if selection == "Young":
-        return (not pd.isna(age)) and (age <= 25)
-    if selection == "Top tier":
-        return tier == "top tier"
-    if selection == "Mid-tier":
-        return tier == "mid-tier"
-    if selection == "Depth":
-        return tier == "depth"
-    return True
+        return is_young
+    else:
+        return tier == selection
 
 def find_offer_for_target_simple(my_team, target_team, target_player_name, tolerance_pct=0.18):
-    """Simpler / faster: only single player or player+pick combos."""
+    """Single-player target: only simple player/pick combos."""
     r = players_df.loc[players_df["Player"] == target_player_name]
     if r.empty:
         return []
     target_val = float(r["BaseValue"].iloc[0])
 
+    # Avoid suggesting tiny targets for very large assets (like a 1st)
+    if target_val <= 0:
+        return []
     my_players, my_picks = build_asset_lists_for_team(my_team)
 
     combos = []
@@ -1134,12 +1124,79 @@ def find_offer_for_target_simple(my_team, target_team, target_player_name, toler
         total = vals_p + vals_pk
         if total <= 0:
             continue
+
+        # If we're sending a 1st and target is depth-only, skip
+        send_contains_first = any(
+            parse_pick_label(lbl)[1] == 1 for lbl in give_picks if parse_pick_label(lbl)[1] is not None
+        )
+        t_row = players_df.loc[players_df["Player"] == target_player_name]
+        target_tier = t_row["TierGroup"].iloc[0] if not t_row.empty else None
+        if send_contains_first and target_tier == "Depth":
+            continue
+
         pct_diff = abs(total - target_val) / max(target_val, total)
         if pct_diff <= tolerance_pct:
             suggestions.append((give_players, give_picks, total, pct_diff))
 
     suggestions.sort(key=lambda x: x[3])
-    return suggestions[:1]  # only the best idea here
+    return suggestions[:1]
+
+def find_offer_for_multi_target_simple(
+    my_team, target_team, target_player_names, tolerance_pct=0.18
+):
+    """Multi-player target: used when user selects multiple positions (RB+WR, etc.)."""
+    target_vals = []
+    for name in target_player_names:
+        r = players_df.loc[players_df["Player"] == name]
+        if r.empty:
+            return []
+        target_vals.append(float(r["BaseValue"].iloc[0]))
+    target_total = sum(target_vals)
+    if target_total <= 0:
+        return []
+
+    my_players, my_picks = build_asset_lists_for_team(my_team)
+    combos = []
+
+    # Single player
+    for p in my_players[:10]:
+        combos.append(([p[0]], []))
+
+    # Player + pick
+    for p in my_players[:6]:
+        for pk in my_picks[:4]:
+            combos.append(([p[0]], [pk[0]]))
+
+    # Two players (light)
+    for i in range(min(4, len(my_players))):
+        for j in range(i + 1, min(7, len(my_players))):
+            combos.append(([my_players[i][0], my_players[j][0]], []))
+
+    suggestions = []
+    for give_players, give_picks in combos:
+        vals_p, _ = sum_players_value(give_players, team_pos_counts(my_team))
+        vals_pk, _ = sum_picks_value(give_picks)
+        total = vals_p + vals_pk
+        if total <= 0:
+            continue
+
+        # Prevent "massive asset for two depth darts"
+        if any(parse_pick_label(lbl)[1] == 1 for lbl in give_picks if parse_pick_label(lbl)[1] is not None):
+            # if both targets are Depth, don't pay with a 1st
+            tiers = [
+                players_df.loc[players_df["Player"] == nm, "TierGroup"].iloc[0]
+                for nm in target_player_names
+                if not players_df.loc[players_df["Player"] == nm].empty
+            ]
+            if tiers and all(t == "Depth" for t in tiers):
+                continue
+
+        pct_diff = abs(total - target_total) / max(target_total, total)
+        if pct_diff <= tolerance_pct:
+            suggestions.append((give_players, give_picks, total, pct_diff))
+
+    suggestions.sort(key=lambda x: x[3])
+    return suggestions[:1]
 
 def find_return_for_package(
     my_team,
@@ -1311,7 +1368,6 @@ with tab_calc:
             st.markdown("---")
             st.subheader("Analysis")
 
-            # Category info helper
             with st.expander("What do these categories mean?"):
                 st.markdown(
                     """
@@ -1349,9 +1405,7 @@ with tab_calc:
             notesA = build_needs_summary(teamA, countsA_before, countsA_after, A_in_details)
             notesB = build_needs_summary(teamB, countsB_before, countsB_after, B_in_details)
 
-            # Combined breakdown: roster context + player details
             with st.expander("Full breakdown: roster context & player details", expanded=True):
-                # Team A
                 st.markdown(f"### {teamA} receives")
                 if notesA:
                     for n in notesA:
@@ -1374,7 +1428,6 @@ with tab_calc:
 
                 st.markdown("---")
 
-                # Team B
                 st.markdown(f"### {teamB} receives")
                 if notesB:
                     for n in notesB:
@@ -1395,7 +1448,6 @@ with tab_calc:
                         height=min(300, 40 + 30 * len(B_in_pick_details)),
                     )
 
-            # Simple improvement suggestions
             st.markdown("#### Suggestions to improve or balance the deal")
             suggestions = []
             diff_val = A_in_total - B_in_total
@@ -1410,7 +1462,7 @@ with tab_calc:
                 )
                 suggestions.append(
                     "You can also tweak the sliders on the left if you personally "
-                    "value youth, elite players, or future picks a bit differently."
+                    "value youth, top-end options, or future picks a bit differently."
                 )
             else:
                 suggestions.append(
@@ -1430,7 +1482,6 @@ with tab_finder:
         horizontal=True,
     )
 
-    # Random default for "my team"
     if team_list:
         default_my_team = random.choice(team_list)
     else:
@@ -1452,13 +1503,19 @@ with tab_finder:
         target_positions = st.multiselect(
             "Positions (optional)",
             ["QB", "RB", "WR", "TE"],
-            default=["RB", "WR"],
+            default=["RB"],  # start with RB only
         )
 
         position_type_choice = st.selectbox(
             "Position type (optional)",
-            ["Any", "Young", "Top tier", "Mid-tier", "Depth"],
-            help="Filter the kinds of players you want to target based on FantasyPros rank and age.",
+            ["Any", "High-Tier", "Starter", "Flex", "Depth", "Young"],
+            help=(
+                "High-Tier: must-start level\n"
+                "Starter: usually in the lineup\n"
+                "Flex: could be in a flex spot\n"
+                "Depth: bench/injury fill-in\n"
+                "Young: age 26 or younger (independent of tier)"
+            ),
         )
 
         target_pick_rounds = st.multiselect(
@@ -1473,32 +1530,65 @@ with tab_finder:
             for ot in other_teams:
                 players_other, picks_other = build_asset_lists_for_team(ot)
 
-                # Player targets by position & tier/age
-                cand_players = [
-                    p
-                    for p in players_other
-                    if (not target_positions or p[1] in target_positions)
-                    and matches_position_type(p[0], position_type_choice)
-                ][:5]
+                # ----- PLAYER-BASED OFFERS -----
+                if target_positions:
+                    positions_chosen = list(target_positions)
 
-                for p in cand_players:
-                    cand_target = p[0]
-                    offers = find_offer_for_target_simple(my_team, ot, cand_target)
-                    for give_players, give_picks, total, pct in offers:
-                        suggestions_all.append(
-                            {
-                                "From": my_team,
-                                "To": ot,
-                                "You Get": [cand_target],
-                                "You Send players": give_players,
-                                "You Send picks": give_picks,
-                                "Approx value gap": pct,
-                            }
-                        )
+                    if len(positions_chosen) == 1:
+                        # Single position: behave like previous version
+                        pos = positions_chosen[0]
+                        cand_players = [
+                            p
+                            for p in players_other
+                            if p[1] == pos and matches_position_type(p[0], position_type_choice)
+                        ][:5]
+                        for p in cand_players:
+                            cand_target = p[0]
+                            offers = find_offer_for_target_simple(my_team, ot, cand_target)
+                            for give_players, give_picks, total, pct in offers:
+                                suggestions_all.append(
+                                    {
+                                        "From": my_team,
+                                        "To": ot,
+                                        "You Get": [cand_target],
+                                        "You Send players": give_players,
+                                        "You Send picks": give_picks,
+                                        "Approx value gap": pct,
+                                    }
+                                )
+                    else:
+                        # Multiple positions: want a bundle with one player from each selected position
+                        pos_to_candidates = {}
+                        for pos in positions_chosen:
+                            cand = [
+                                p for p in players_other
+                                if p[1] == pos and matches_position_type(p[0], position_type_choice)
+                            ]
+                            if not cand:
+                                pos_to_candidates = {}
+                                break
+                            pos_to_candidates[pos] = cand[:3]
+                        if pos_to_candidates:
+                            # We'll just take best candidate per pos as one bundle
+                            bundle_names = [pos_to_candidates[pos][0][0] for pos in positions_chosen]
+                            offers_multi = find_offer_for_multi_target_simple(
+                                my_team, ot, bundle_names
+                            )
+                            for give_players, give_picks, total, pct in offers_multi:
+                                suggestions_all.append(
+                                    {
+                                        "From": my_team,
+                                        "To": ot,
+                                        "You Get": bundle_names,
+                                        "You Send players": give_players,
+                                        "You Send picks": give_picks,
+                                        "Approx value gap": pct,
+                                    }
+                                )
 
-                # Pick-only targets
+                # ----- PICK-BASED OFFERS -----
                 if target_pick_rounds:
-                    for lbl, val in picks_other[:6]:
+                    for lbl, val in picks_other[:10]:
                         yr, rnd, orig = parse_pick_label(lbl)
                         if rnd not in target_pick_rounds:
                             continue
@@ -1555,7 +1645,6 @@ with tab_finder:
                         f"{', '.join(sug['You Get'])}"
                     )
 
-                    # Build explanation using FantasyPros ranks
                     recv_players = [
                         asset
                         for asset in sug["You Get"]
@@ -1655,23 +1744,24 @@ with st.expander("For more information, click here."):
 - **Rankings:** Uses the latest FantasyPros **Dynasty Superflex PPR** expert consensus.
 - **Scoring curves:** Looks at historical PPR scoring by position to understand how fast production falls off (for example, WR1 vs WR20).
 - **Age profiles:** Younger cores get a small bump; older players get a soft haircut, especially at RB.
-- **Positional scarcity:** Positions with fewer reliable options get a **small** premium, but not enough to make a mid TE more valuable than a truly premium WR or QB.
+- **Positional tiers:** Each player is tagged as **High-Tier**, **Starter**, **Flex**, or **Depth** based on overall FantasyPros rank, plus a separate **Young (≤26)** flag.
+- **Positional scarcity:** Positions with fewer reliable options get a **small** premium, but not enough to make a depth TE more valuable than a truly premium WR or QB.
 - **Team needs:** Roster needs are a *minor* factor — helpful for tiebreakers, not something that overrides rankings.
 - **Picks:** Future picks are valued by:
   - Round (1st vs 2nd vs 3rd vs 4th),
   - How strong the original team looks (record + top players),
   - How far out the pick is (further years are slightly discounted),
   - A very small tweak for how many picks a team already has.
-- **Monotonic sanity check:** If a player is ranked ahead of another overall (for example, WR at #66 vs TE at #77), the lower-ranked player cannot have more model value — even across positions.
+- **Monotonic sanity check:** If a player is ranked ahead of another overall, the lower-ranked player cannot have more model value — even across positions.
 
 ### Rough change log
 
 - ✅ Switched from static CSVs to **live FantasyPros + Sleeper**.
 - ✅ Added **future pick valuation** based on original team strength and year.
-- ✅ Smoothed player values so top-end options (like elite WRs) pull away more from mid-tier choices.
+- ✅ Smoothed player values so top-end options pull away more from mid-tier choices.
 - ✅ Added **trade categories** (Perfect Fit → Call the Commissioner) for quick gut checks.
 - ✅ Built a **Trade Finder** with two modes:
-  - “Acquire position/picks” to find ways to target specific spots or draft capital, now with filters for young / top tier / mid-tier / depth.
+  - “Acquire position/picks” to find ways to target specific spots or draft capital, now with filters for High-Tier / Starter / Flex / Depth / Young.
   - “Trade away” to see what you could reasonably get back for a package.
 - ✅ Tweaked layouts for mobile, simplified the header, and combined context + details into one breakdown section.
 """
