@@ -906,6 +906,25 @@ def build_needs_summary(team, before_counts, after_counts, incoming_details):
 
     return notes
 
+# Helper: max reasonable pick round for a given FP rank
+def max_pick_round_for_rank(rank: float) -> int:
+    """
+    Max *good* pick round you'd reasonably send straight up for this rank.
+    Lower number = better pick. We disallow offering picks better than this.
+    """
+    if rank > 300:
+        # Really deep — 4th at most
+        return 4
+    elif rank > 240:
+        # Late/very deep bench — 3rd at most
+        return 3
+    elif rank > 150:
+        # Deeper flex/bench — 2nd at most
+        return 2
+    else:
+        # Starter/top-ish — 1sts allowed
+        return 1
+
 # ====================================================
 # Trade evaluation text helpers
 # ====================================================
@@ -1090,14 +1109,15 @@ def matches_position_type(player_name: str, selection: str) -> bool:
     else:
         return tier == selection
 
-def find_offer_for_target_simple(my_team, target_team, target_player_name, tolerance_pct=0.18):
-    """Single-player target: only simple player/pick combos."""
+def find_offer_for_target_simple(my_team, target_team, target_player_name, tolerance_pct=0.25):
+    """Single-player target: only simple player/pick combos with rank-aware pick caps."""
     r = players_df.loc[players_df["Player"] == target_player_name]
     if r.empty:
         return []
     target_val = float(r["BaseValue"].iloc[0])
+    target_rank = float(r["Rank"].iloc[0])
+    target_tier = r["TierGroup"].iloc[0]
 
-    # Avoid suggesting tiny targets for very large assets (like a 1st)
     if target_val <= 0:
         return []
     my_players, my_picks = build_asset_lists_for_team(my_team)
@@ -1112,10 +1132,15 @@ def find_offer_for_target_simple(my_team, target_team, target_player_name, toler
     for pk in my_picks[:6]:
         combos.append(([], [pk[0]]))
 
-    # Player + pick combos (small sample)
+    # Player + pick combos
     for p in my_players[:6]:
         for pk in my_picks[:4]:
             combos.append(([p[0]], [pk[0]]))
+
+    # Two-player combos (no picks) to make depth-for-depth/young deals easier
+    for i in range(min(6, len(my_players))):
+        for j in range(i + 1, min(9, len(my_players))):
+            combos.append(([my_players[i][0], my_players[j][0]], []))
 
     suggestions = []
     for give_players, give_picks in combos:
@@ -1125,12 +1150,23 @@ def find_offer_for_target_simple(my_team, target_team, target_player_name, toler
         if total <= 0:
             continue
 
-        # If we're sending a 1st and target is depth-only, skip
+        # Rank-aware cap on how good a pick you can send for this target
+        offered_rounds = []
+        for lbl in give_picks:
+            yr, rnd, orig = parse_pick_label(lbl)
+            if rnd is not None:
+                offered_rounds.append(rnd)
+        if offered_rounds:
+            best_round = min(offered_rounds)  # 1 is best, 4 worst
+            max_round_allowed = max_pick_round_for_rank(target_rank)
+            if best_round < max_round_allowed:
+                # e.g. target rank 320 => max_round_allowed=4, but you're offering R2 -> skip
+                continue
+
+        # Extra protection: don't use a premium pick for pure depth
         send_contains_first = any(
             parse_pick_label(lbl)[1] == 1 for lbl in give_picks if parse_pick_label(lbl)[1] is not None
         )
-        t_row = players_df.loc[players_df["Player"] == target_player_name]
-        target_tier = t_row["TierGroup"].iloc[0] if not t_row.empty else None
         if send_contains_first and target_tier == "Depth":
             continue
 
@@ -1142,35 +1178,41 @@ def find_offer_for_target_simple(my_team, target_team, target_player_name, toler
     return suggestions[:1]
 
 def find_offer_for_multi_target_simple(
-    my_team, target_team, target_player_names, tolerance_pct=0.18
+    my_team, target_team, target_player_names, tolerance_pct=0.28
 ):
     """Multi-player target: used when user selects multiple positions (RB+WR, etc.)."""
     target_vals = []
+    ranks = []
+    tiers = []
     for name in target_player_names:
         r = players_df.loc[players_df["Player"] == name]
         if r.empty:
             return []
         target_vals.append(float(r["BaseValue"].iloc[0]))
+        ranks.append(float(r["Rank"].iloc[0]))
+        tiers.append(r["TierGroup"].iloc[0])
     target_total = sum(target_vals)
     if target_total <= 0:
         return []
 
+    worst_rank = max(ranks)  # lowest-quality among targets
+
     my_players, my_picks = build_asset_lists_for_team(my_team)
     combos = []
 
-    # Single player
+    # single player
     for p in my_players[:10]:
         combos.append(([p[0]], []))
 
-    # Player + pick
+    # two players
+    for i in range(min(6, len(my_players))):
+        for j in range(i + 1, min(9, len(my_players))):
+            combos.append(([my_players[i][0], my_players[j][0]], []))
+
+    # player + pick
     for p in my_players[:6]:
         for pk in my_picks[:4]:
             combos.append(([p[0]], [pk[0]]))
-
-    # Two players (light)
-    for i in range(min(4, len(my_players))):
-        for j in range(i + 1, min(7, len(my_players))):
-            combos.append(([my_players[i][0], my_players[j][0]], []))
 
     suggestions = []
     for give_players, give_picks in combos:
@@ -1180,15 +1222,16 @@ def find_offer_for_multi_target_simple(
         if total <= 0:
             continue
 
-        # Prevent "massive asset for two depth darts"
-        if any(parse_pick_label(lbl)[1] == 1 for lbl in give_picks if parse_pick_label(lbl)[1] is not None):
-            # if both targets are Depth, don't pay with a 1st
-            tiers = [
-                players_df.loc[players_df["Player"] == nm, "TierGroup"].iloc[0]
-                for nm in target_player_names
-                if not players_df.loc[players_df["Player"] == nm].empty
-            ]
-            if tiers and all(t == "Depth" for t in tiers):
+        # Rank-aware cap on pick quality vs worst target rank
+        offered_rounds = []
+        for lbl in give_picks:
+            yr, rnd, orig = parse_pick_label(lbl)
+            if rnd is not None:
+                offered_rounds.append(rnd)
+        if offered_rounds:
+            best_round = min(offered_rounds)
+            max_round_allowed = max_pick_round_for_rank(worst_rank)
+            if best_round < max_round_allowed:
                 continue
 
         pct_diff = abs(total - target_total) / max(target_total, total)
@@ -1544,7 +1587,7 @@ with tab_finder:
                         ][:5]
                         for p in cand_players:
                             cand_target = p[0]
-                            offers = find_offer_for_target_simple(my_team, ot, cand_target)
+                            offers = find_offer_for_target_simple(my_team, ot, cand_target, tolerance_pct=0.25)
                             for give_players, give_picks, total, pct in offers:
                                 suggestions_all.append(
                                     {
@@ -1572,7 +1615,7 @@ with tab_finder:
                             # We'll just take best candidate per pos as one bundle
                             bundle_names = [pos_to_candidates[pos][0][0] for pos in positions_chosen]
                             offers_multi = find_offer_for_multi_target_simple(
-                                my_team, ot, bundle_names
+                                my_team, ot, bundle_names, tolerance_pct=0.28
                             )
                             for give_players, give_picks, total, pct in offers_multi:
                                 suggestions_all.append(
