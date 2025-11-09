@@ -1261,13 +1261,28 @@ def find_return_for_package(
     outgoing_picks,
     tolerance_pct=0.18,
 ):
-    """Given what I'm sending, find packages from the other team that roughly match value."""
+    """
+    Given what I'm sending, find packages from the other team that roughly match value.
+
+    Loosens tolerance a bit if you're only sending a premium 1st.
+    """
     counts_my = team_pos_counts(my_team)
     val_p, _ = sum_players_value(outgoing_players, counts_my)
     val_pk, _ = sum_picks_value(outgoing_picks)
     target_total = val_p + val_pk
     if target_total <= 0:
         return []
+
+    # If you're only sending picks, and at least one is a 1st, allow looser window
+    only_picks = (not outgoing_players) and bool(outgoing_picks)
+    contains_first = any(
+        (parse_pick_label(lbl)[1] == 1)
+        for lbl in outgoing_picks
+        if parse_pick_label(lbl)[1] is not None
+    )
+    eff_tol = tolerance_pct
+    if only_picks and contains_first:
+        eff_tol = max(eff_tol, 0.35)
 
     players_other, picks_other = build_asset_lists_for_team(other_team)
 
@@ -1276,6 +1291,15 @@ def find_return_for_package(
     # single player
     for p in players_other[:10]:
         combos.append(([p[0]], []))
+
+    # pick-only from the other team (pick-for-pick swaps / consolidation)
+    for pk in picks_other[:6]:
+        combos.append(([], [pk[0]]))
+
+    # two players
+    for i in range(min(6, len(players_other))):
+        for j in range(i + 1, min(9, len(players_other))):
+            combos.append(([players_other[i][0], players_other[j][0]], []))
 
     # player + pick
     for p in players_other[:6]:
@@ -1291,7 +1315,7 @@ def find_return_for_package(
         if total <= 0:
             continue
         pct_diff = abs(total - target_total) / max(target_total, total)
-        if pct_diff <= tolerance_pct:
+        if pct_diff <= eff_tol:
             suggestions.append((recv_players, recv_picks, total, pct_diff))
 
     suggestions.sort(key=lambda x: x[3])
@@ -1530,7 +1554,7 @@ with tab_calc:
 
 # -------------------- Trade Finder --------------------
 with tab_finder:
-    st.subheader("Trade Finder (beta)")
+    st.subheader("Trade Finder")
 
     finder_mode = st.radio(
         "What do you want help with?",
@@ -1580,7 +1604,18 @@ with tab_finder:
             help="Leave empty if you only care about players.",
         )
 
-        if st.button("Suggest trade ideas", key="btn_acquire"):
+        col_btn1, col_btn2 = st.columns(2)
+        with col_btn1:
+            btn_acquire_main = st.button("Suggest trade ideas", key="btn_acquire_main")
+        with col_btn2:
+            btn_acquire_more = st.button("Suggest New Options", key="btn_acquire_more")
+
+        if btn_acquire_main or btn_acquire_more:
+            looser = btn_acquire_more
+            tolerance_player_single = 0.25 if not looser else 0.40
+            tolerance_multi = 0.28 if not looser else 0.42
+            tolerance_pick = 0.20 if not looser else 0.30
+
             suggestions_all = []
 
             for ot in other_teams:
@@ -1600,7 +1635,9 @@ with tab_finder:
                         ][:5]
                         for p in cand_players:
                             cand_target = p[0]
-                            offers = find_offer_for_target_simple(my_team, ot, cand_target, tolerance_pct=0.25)
+                            offers = find_offer_for_target_simple(
+                                my_team, ot, cand_target, tolerance_pct=tolerance_player_single
+                            )
                             for give_players, give_picks, total, pct in offers:
                                 suggestions_all.append(
                                     {
@@ -1628,7 +1665,7 @@ with tab_finder:
                             # We'll just take best candidate per pos as one bundle
                             bundle_names = [pos_to_candidates[pos][0][0] for pos in positions_chosen]
                             offers_multi = find_offer_for_multi_target_simple(
-                                my_team, ot, bundle_names, tolerance_pct=0.28
+                                my_team, ot, bundle_names, tolerance_pct=tolerance_multi
                             )
                             for give_players, give_picks, total, pct in offers_multi:
                                 suggestions_all.append(
@@ -1668,7 +1705,7 @@ with tab_finder:
                             if tot <= 0:
                                 continue
                             pct_gap = abs(tot - target_val) / max(tot, target_val)
-                            if pct_gap <= 0.20:
+                            if pct_gap <= tolerance_pick:
                                 suggestions_all.append(
                                     {
                                         "From": my_team,
@@ -1712,6 +1749,12 @@ with tab_finder:
                         "Try tweaking filters or sliders."
                     )
                 else:
+                    if looser:
+                        st.info(
+                            "These suggestions use a **looser fairness window**, so a few ideas may feel a bit more "
+                            "one-sided, but they still sit in a range many leagues would consider at least possible."
+                        )
+
                     st.markdown("### Suggested ideas")
                     for i, sug in enumerate(filtered, start=1):
                         st.markdown(f"**Idea #{i}** — {sug['From']} ↔ {sug['To']}")
@@ -1758,11 +1801,24 @@ with tab_finder:
             key="finder_send_picks",
         )
 
-        if st.button("Suggest what you could get back", key="btn_trade_away"):
+        col_btn1, col_btn2 = st.columns(2)
+        with col_btn1:
+            btn_away_main = st.button(
+                "Suggest what you could get back", key="btn_trade_away_main"
+            )
+        with col_btn2:
+            btn_away_more = st.button(
+                "Suggest New Options", key="btn_trade_away_more"
+            )
+
+        if btn_away_main or btn_away_more:
+            looser = btn_away_more
+            tolerance = 0.18 if not looser else 0.32
+
             suggestions_all = []
             for ot in other_teams:
                 offers = find_return_for_package(
-                    my_team, ot, send_players, send_picks
+                    my_team, ot, send_players, send_picks, tolerance_pct=tolerance
                 )
                 for recv_players, recv_picks, total, pct in offers:
                     suggestions_all.append(
@@ -1783,6 +1839,13 @@ with tab_finder:
                 )
             else:
                 suggestions_all.sort(key=lambda s: s["Approx value gap"])
+
+                if looser:
+                    st.info(
+                        "These suggestions use a **wider value range**, so a few may feel less strictly balanced, "
+                        "but they should still be in the realm of 'someone might actually consider this'."
+                    )
+
                 st.markdown("### Suggested ideas")
                 for i, sug in enumerate(suggestions_all[:3], start=1):
                     st.markdown(f"**Idea #{i}** — {sug['From']} ↔ {sug['To']}")
