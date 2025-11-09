@@ -5,6 +5,7 @@ from datetime import datetime
 from itertools import combinations
 import random
 import requests
+import matplotlib.pyplot as plt
 
 # -------------------- Page config --------------------
 st.set_page_config(
@@ -231,7 +232,7 @@ def load_ppr_curves():
 def load_age_table():
     """
     Load player ages from data/fantasyage.csv (Player, Age or Player, Yrs).
-    Used only for small adjustments to pick values.
+    Used only for small adjustments to player values and pick values.
     """
     try:
         df = pd.read_csv("data/fantasyage.csv")
@@ -299,6 +300,12 @@ PACKAGE_PENALTY = st.sidebar.slider(
     "2-for-1 tax (multiple smaller players vs one stud)",
     0.0, 1.0, 0.75, 0.05,
     help="Higher = quantity counts less vs quality. Prevents 3 mid players from beating 1 superstar."
+)
+
+RISK_PREF = st.sidebar.slider(
+    "Risk vs safety preference",
+    0.0, 1.0, 0.5, 0.05,
+    help="0 = prefer safer, established vets. 1 = prefer younger upside. 0.5 = neutral."
 )
 
 st.sidebar.header("3) Advanced pick tuning (optional)")
@@ -452,7 +459,7 @@ if league_logo:
     st.image(league_logo, width=72)
 
 # ====================================================
-# Core valuation helpers (with PPR curves & scarcity)
+# Core valuation helpers (with PPR curves, age, risk)
 # ====================================================
 
 players_df = players_df.copy()
@@ -462,6 +469,7 @@ players_df = players_df.dropna(subset=["Rank"]).reset_index(drop=True)
 players_df["Pos"] = players_df["Pos"].astype(str).str.upper().str.strip()
 players_df["PosRank"] = players_df.groupby("Pos")["Rank"].rank(method="first")
 
+# Positional scarcity based on how many top-100 players each position has
 TOP_CUTOFF = 100
 top_slice = players_df[players_df["Rank"] <= TOP_CUTOFF]
 counts = top_slice["Pos"].value_counts()
@@ -485,7 +493,74 @@ for pos in ["QB", "RB", "WR", "TE"]:
 
 players_df["PosMult"] = players_df["Pos"].map(posmult_effective).fillna(1.0)
 
+# Load curves and ages
 ppr_curves = load_ppr_curves()
+ages_table = load_age_table()
+
+# Attach age to players_df (if available)
+players_df["Norm"] = players_df["Player"].apply(normalize_name)
+if ages_table is not None:
+    ages_merge = ages_table[["Norm", "Age"]].copy()
+    players_df = players_df.merge(ages_merge, on="Norm", how="left")
+else:
+    players_df["Age"] = np.nan
+
+# Age config per position: (peak_age, decline_start, floor_mult, young_boost_max)
+AGE_CFG = {
+    "QB": (27, 33, 0.80, 0.06),
+    "RB": (24, 27, 0.55, 0.10),
+    "WR": (26, 29, 0.65, 0.08),
+    "TE": (27, 30, 0.70, 0.06),
+}
+
+def age_mult_for_player(pos, age):
+    if pd.isna(age):
+        return 1.0
+    pos = str(pos).upper()
+    peak, decline_start, floor_mult, young_boost = AGE_CFG.get(
+        pos, (26, 30, 0.7, 0.06)
+    )
+    age = float(age)
+
+    # Younger than peak: small bonus max young_boost
+    if age <= peak:
+        span = 6.0  # how many years below peak still get boosted
+        factor = (peak - age) / span
+        factor = max(0.0, min(1.0, factor))
+        return 1.0 + young_boost * factor
+
+    # Between peak and start of decline: neutral
+    if age <= decline_start:
+        return 1.0
+
+    # After decline: gradual drop until floor_mult
+    years_over = age - decline_start
+    decline_span = 6.0
+    per_year = (1.0 - floor_mult) / decline_span
+    mult = 1.0 - per_year * years_over
+    return max(floor_mult, mult)
+
+def risk_mult_for_player(pos, age):
+    """
+    Risk slider:
+      - If RISK_PREF > 0.5 => favor younger upside.
+      - If RISK_PREF < 0.5 => favor safer vets a bit more.
+    Effect is intentionally small (~±10% max).
+    """
+    if pd.isna(age):
+        return 1.0
+    pos = str(pos).upper()
+    peak, _, _, _ = AGE_CFG.get(pos, (26, 30, 0.7, 0.06))
+    age = float(age)
+
+    # youth_score in [-1, 1]: positive = younger than peak, negative = older
+    youth_score = (peak - age) / 8.0
+    youth_score = max(-1.0, min(1.0, youth_score))
+
+    # If RISK_PREF=0.5 => effect is zero.
+    # At the extremes, max ±10% tilt.
+    factor = 1.0 + (RISK_PREF - 0.5) * 0.2 * youth_score
+    return float(max(0.9, min(1.1, factor)))
 
 def estimate_points(row):
     pos = row["Pos"]
@@ -513,7 +588,7 @@ max_pts = players_df["ModelPoints"].max()
 
 if max_pts <= 0:
     # Fallback if something goes wrong with the PPR curves
-    players_df["BaseValue"] = (
+    players_df["BaseValueRaw"] = (
         ELITE_GAP * np.exp(-RANK_IMPORTANCE * (players_df["Rank"] - 1))
     ).round(2)
 else:
@@ -521,29 +596,46 @@ else:
     rel_pts = (players_df["ModelPoints"] / max_pts).clip(0.0001, 1.0)
 
     # 2) Make the curve steeper so elites separate more from mid-tier
-    #    Bigger RANK_IMPORTANCE still makes the drop-off faster.
     curve_power = 1.6 + (RANK_IMPORTANCE - 0.015) * 30.0
     base_curve = np.power(rel_pts, curve_power)
 
     # 3) Tier multiplier: top overall ranks get a little extra bump
-    #    This keeps guys like CeeDee / Waddle clearly above WR20–WR30 types.
     overall_rank = players_df["Rank"].rank(method="first")
 
-    tier_mult = np.where(
-        overall_rank <= 12, 1.30,        # true elite tier
+    tier_mult_raw = np.where(
+        overall_rank <= 12, 1.30,
         np.where(
-            overall_rank <= 24, 1.18,    # strong WR1 / RB1 / QB1 range
+            overall_rank <= 24, 1.18,
             np.where(
-                overall_rank <= 48, 1.08,  # solid starters
-                1.00                       # everyone else
+                overall_rank <= 48, 1.08,
+                1.00
             )
         )
     )
 
-    players_df["BaseValue"] = (ELITE_GAP * base_curve * tier_mult).round(2)
+    # 4) Dynamic tier tweak based on positional scarcity
+    pos_sc = players_df["Pos"].map(scarcity_mult).fillna(1.0).values
+    # If a position is scarcer (>1.0), elites get a bit more boost; if abundant (<1.0), a bit less
+    tier_mult = tier_mult_raw * (1.0 + 0.35 * (pos_sc - 1.0))
 
+    players_df["BaseValueRaw"] = (ELITE_GAP * base_curve * tier_mult).round(2)
 
-ages_table = load_age_table()
+# 5) Apply age & risk multipliers
+if "Age" in players_df.columns:
+    players_df["AgeMult"] = players_df.apply(lambda r: age_mult_for_player(r["Pos"], r["Age"]), axis=1)
+    players_df["RiskMult"] = players_df.apply(lambda r: risk_mult_for_player(r["Pos"], r["Age"]), axis=1)
+else:
+    players_df["AgeMult"] = 1.0
+    players_df["RiskMult"] = 1.0
+
+players_df["BaseValue"] = (
+    players_df["BaseValueRaw"] * players_df["PosMult"] * players_df["AgeMult"] * players_df["RiskMult"]
+).round(2)
+
+# ====================================================
+# Team ages (for pick context) using the same age table
+# ====================================================
+
 team_avg_age = {}
 league_avg_age = None
 if ages_table is not None and not rosters_df.empty:
@@ -558,6 +650,10 @@ if ages_table is not None and not rosters_df.empty:
     team_avg_age = grp.to_dict()
     if len(team_avg_age):
         league_avg_age = float(np.nanmean(list(team_avg_age.values())))
+
+# ====================================================
+# Value helper functions
+# ====================================================
 
 def team_pos_counts(team: str):
     names = set(rosters_df.loc[rosters_df["Team"] == team, "Player"].tolist())
@@ -594,7 +690,7 @@ label_map = {
 def team_strength(team: str):
     names = rosters_df.loc[rosters_df["Team"] == team, "Player"].tolist()
     sub = players_df[players_df["Player"].isin(names)].copy()
-    vals = (sub["BaseValue"] * sub["PosMult"]).sort_values(ascending=False).head(N_STRENGTH)
+    vals = sub["BaseValue"].sort_values(ascending=False).head(N_STRENGTH)
     return float(vals.sum()) if len(vals) else 0.0
 
 team_list = sorted(rosters_df["Team"].unique().tolist())
@@ -642,11 +738,11 @@ def pick_value(original_team: str, year: int, rnd: int) -> float:
     slot = team_pick_slot.get(original_team, len(team_list))
     base = pick_base_value(slot, rnd)
 
-    age_mult = 1.0
+    age_mult_pick = 1.0
     if league_avg_age and original_team in team_avg_age:
         delta_age = team_avg_age[original_team] - league_avg_age
         delta_age = max(-3.0, min(3.0, delta_age))
-        age_mult = 1.0 + 0.02 * delta_age
+        age_mult_pick = 1.0 + 0.02 * delta_age
 
     inv_mult = 1.0
     if avg_num_picks > 0 and original_team in original_pick_counts:
@@ -654,7 +750,7 @@ def pick_value(original_team: str, year: int, rnd: int) -> float:
         delta_picks = max(-3.0, min(3.0, delta_picks))
         inv_mult = 1.0 + 0.01 * delta_picks
 
-    return round(base * year_mult * age_mult * inv_mult, 1)
+    return round(base * year_mult * age_mult_pick * inv_mult, 1)
 
 def build_pick_labels_for_team(team: str):
     return picks_by_team.get(team, [])
@@ -695,7 +791,7 @@ def sum_players_value(player_list, team_for_need):
             continue
         pos = r["Pos"].iloc[0]
         rank = int(r["Rank"].iloc[0])
-        base_before_need = float(r["BaseValue"].iloc[0]) * float(r["PosMult"].iloc[0])
+        base_before_need = float(r["BaseValue"].iloc[0])
         mult = apply_need(pos, counts)
         val = base_before_need * mult
         vals.append(val)
@@ -1033,7 +1129,6 @@ with tab_trade:
                         st.write(f"**Picks to {teamB}**")
                         st.table(pd.DataFrame(B_get_pk_det, columns=["Pick", "Value"]))
 
-
 # ----------------------------------------------------
 # TAB 2: TRADE FINDER
 # ----------------------------------------------------
@@ -1158,6 +1253,22 @@ with tab_finder:
             st.write("- " + "\n- ".join(assets))
 
 # ----------------------------------------------------
+# Value curves visualization
+# ----------------------------------------------------
+with st.expander("See value curves by position (what the model thinks your ranks are worth)"):
+    fig, ax = plt.subplots()
+    for pos in ["QB", "RB", "WR", "TE"]:
+        sub = players_df[players_df["Pos"] == pos].sort_values("PosRank")
+        if sub.empty:
+            continue
+        ax.plot(sub["PosRank"], sub["BaseValue"], marker=".", linestyle="-", label=pos)
+    ax.set_xlabel("Positional rank")
+    ax.set_ylabel("Model value (after sliders, age & risk)")
+    ax.set_title("Dynasty Bros. value curve by position")
+    ax.legend()
+    st.pyplot(fig)
+
+# ----------------------------------------------------
 # Explainer / assumptions
 # ----------------------------------------------------
 with st.expander("How this calculator works & assumptions"):
@@ -1166,30 +1277,47 @@ with st.expander("How this calculator works & assumptions"):
 - **Player values** start from FantasyPros **Dynasty Superflex PPR** ranks  
   (lower rank number = better player).
 - We then look at last season's **PPR scoring curves** by position  
-  (QB / RB / WR / TE) from your `data/ppr_curves.xlsx` file.
+  (QB / RB / WR / TE) from your `data/ppr_curves.xlsx` file:
+  - For example: WR5 vs WR20 vs WR30 – how many PPR points they scored.
+  - This lets the app know that an 18–20 PPG WR is meaningfully different from a 14 PPG WR.
 - For each player:
-  - We find their position rank (for example WR8).
-  - We map that to an expected PPR total based on historical curves.
+  - We find their position rank (e.g., WR8).
+  - We map that to an expected PPR total based on the curves.
   - We normalize across all players so the very top asset is around your
-    “How valuable is the #1 player?” slider.
-- **Position value** is adjusted two ways:
-  - A small fixed bump (QB a bit higher, TE a bit lower by default).
-  - A scarcity tweak (positions with fewer top options get a small boost).  
-    TE is capped so mid TEs do not jump ahead of elite WR/RB purely on scarcity.
-- **Roster needs**: if a team is light at a position, incoming players at that
-  position get a small boost. This is intentionally a light factor; rankings and
-  scoring curves are still the core.
-- **Packages**: multiple smaller players do not fully equal one stud. The
-  2-for-1 slider controls that tax.
+    **“How valuable is the #1 player?”** slider.
+  - We then apply:
+    - A **dynamic tier bump** (top 12, 24, 48 overall) that is slightly bigger
+      when a position is scarce.
+    - A **position multiplier** (QB a bit higher; TE lower, and capped so mid TEs
+      don’t leap ahead of elite WR/RB).
+    - A small **age curve** depending on position:
+        - RBs peak earlier and fall off faster.
+        - WRs and QBs hold value longer.
+        - Very young players at a position get a small bonus; older players past
+          the decline point lose a bit of value (within a floor).
+    - A **risk slider**:
+        - If you slide toward *upside*, younger players get a small extra bump
+          vs older vets.
+        - If you slide toward *safety*, vets get a small bump vs younger, more
+          speculative players.
+- **Roster needs**: if a team is thin at a position (e.g., only one QB), incoming
+  players at that position get a light boost. Rankings and PPR curves still matter
+  more than depth.
+- **Packages**: multiple smaller players do not fully equal one stud; the
+  2-for-1 slider controls that “tax”.
 - **Future picks**:
-  - We use Sleeper's traded picks endpoint to see who owns which future picks.
-  - Value depends on the original team's record and roster strength (worse team ⇒
-    earlier, more valuable pick).
-  - There are small nudges based on how old the original roster is and how many
-    picks they already have.
-- The fairness verdict is meant as guidance, not a law. It explains:
-  - Which side likely gets the better deal on pure value.
-  - How far apart the packages are (both in raw value points and %).
-  - Roster context that might make a manager like or dislike the trade anyway.
+  - Ownership and which years/rounds each team has are pulled from Sleeper,
+    including traded picks.
+  - A pick's baseline value depends on the **original team's** record and roster strength
+    (bad teams’ future 1sts are projected earlier and worth more).
+  - There are tiny nudges based on:
+      - How old the original team’s core is (older → picks a bit more valuable).
+      - How many future picks they already have (few picks → each one a bit more valuable).
+  - Further-out picks are discounted (you control how much in the sidebar).
+- The fairness verdict is a **guideline**:
+  - It says which side the numbers think is ahead, by how many “value points,” and by what %.
+  - Roster context explains why a real manager might still like or dislike the deal
+    (QB depth, RB youth, timing of contention, etc.).
+  - Personal takes, injuries, and league-specific quirks will always matter too.
 """
     )
