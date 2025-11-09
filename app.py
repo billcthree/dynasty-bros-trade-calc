@@ -566,7 +566,7 @@ for pos in ["QB", "RB", "WR", "TE"]:
     base_mult = DEFAULT_POSMULT.get(pos, 1.0)
     eff = base_mult * scarcity_mult.get(pos, 1.0)
     if pos == "TE":
-        eff = min(eff, 0.85)  # keep TEs definitely under WR/QB stars
+        eff = min(eff, 0.85)  # keep TEs definitely under WR/QB top-end options
     posmult_effective[pos] = eff
 
 players_df["PosMult"] = players_df["Pos"].map(posmult_effective).fillna(1.0)
@@ -689,6 +689,17 @@ for i in range(1, len(vals)):
     if vals[i] > vals[i - 1]:
         vals[i] = vals[i - 1] * 0.999
 players_df["BaseValue"] = vals
+
+# Player tier labels for Trade Finder filters
+def tier_label(rank: float) -> str:
+    if rank <= 36:
+        return "top tier"
+    elif rank <= 96:
+        return "mid-tier"
+    else:
+        return "depth"
+
+players_df["TierLabel"] = players_df["Rank"].apply(tier_label)
 
 # Team ages for pick context
 team_avg_age = {}
@@ -943,7 +954,7 @@ def trade_category_and_blurb(side_a_value, side_b_value, teamA, teamB, A_desc, B
             f"This trade likely leans toward **{winner}**, by about **{margin_side:,.0f} value "
             f"points (~{pct*100:.1f}% more value)** than {loser}. "
             "In practice, that usually means the side getting more value is consolidating slightly better-ranked pieces "
-            "or more future flexibility."
+            "or a bit more future flexibility."
         )
     else:
         winner, loser = teamB, teamA
@@ -952,15 +963,14 @@ def trade_category_and_blurb(side_a_value, side_b_value, teamA, teamB, A_desc, B
             f"This trade likely leans toward **{winner}**, by about **{margin_side:,.0f} value "
             f"points (~{pct*100:.1f}% more value)** than {loser}. "
             "It's the kind of deal many leagues would still allow, but some managers might push back if they see "
-            "one side stacking more of the better-ranked assets."
+            "one side stacking more of the higher-ranked assets."
         )
 
-    # Small descriptive add-on using the packages
     extra = (
         f"\n\n**{teamA} receives:** {A_desc}\n\n"
         f"**{teamB} receives:** {B_desc}\n\n"
-        "From a big-picture standpoint, think in terms of who is gaining (or giving up) more of the top-ranked, "
-        "core pieces versus depth or future darts. The numbers help frame that, but each manager's timeline and "
+        "From a big-picture standpoint, think in terms of who is gaining (or giving up) more of the better-ranked, "
+        "core pieces versus depth or future dart throws. The numbers help frame that, but each manager's timeline and "
         "risk tolerance will tilt things one way or the other."
     )
 
@@ -985,6 +995,73 @@ def format_pick_detail_table(details):
     df["Value"] = df["Value"].round(1)
     return df
 
+def player_rank_blurb(name: str):
+    r = players_df.loc[players_df["Player"] == name]
+    if r.empty:
+        return None
+    pos = r["Pos"].iloc[0]
+    rk = int(r["Rank"].iloc[0])
+    return f"{name} is around overall **#{rk}** as a **{pos}** in the FantasyPros dynasty superflex rankings."
+
+def build_suggestion_explanation(
+    send_players, send_picks, recv_players, recv_picks, gap_pct
+):
+    lines = []
+
+    main_recv = recv_players[0] if recv_players else None
+    main_send = send_players[0] if send_players else None
+
+    if main_recv and main_send:
+        recv_blurb = player_rank_blurb(main_recv)
+        send_blurb = player_rank_blurb(main_send)
+        if recv_blurb and send_blurb:
+            lines.append(f"{recv_blurb} In return, you're sending {send_blurb}")
+        elif recv_blurb:
+            lines.append(recv_blurb)
+        elif send_blurb:
+            lines.append(send_blurb)
+    elif main_recv:
+        recv_blurb = player_rank_blurb(main_recv)
+        if recv_blurb:
+            lines.append(recv_blurb)
+
+    if recv_picks:
+        pick_descriptions = []
+        for lbl in recv_picks:
+            yr, rnd, orig = parse_pick_label(lbl)
+            if yr is None:
+                continue
+            pick_descriptions.append(
+                f"{lbl} (a {yr} round {rnd} pick originally belonging to {orig})"
+            )
+        if pick_descriptions:
+            lines.append(
+                "You're also getting some draft capital: "
+                + ", ".join(pick_descriptions)
+                + "."
+            )
+
+    if send_picks:
+        pick_descriptions = []
+        for lbl in send_picks:
+            yr, rnd, orig = parse_pick_label(lbl)
+            if yr is None:
+                continue
+            pick_descriptions.append(f"{lbl} (originally from {orig})")
+        if pick_descriptions:
+            lines.append(
+                "In exchange, you're including picks like "
+                + ", ".join(pick_descriptions)
+                + "."
+            )
+
+    lines.append(
+        f"Overall, the model sees the two sides as being within about **{gap_pct*100:.1f}%** of each other in value, "
+        "based on those FantasyPros rankings and the way future picks are discounted by year and projected finish."
+    )
+
+    return " ".join(lines)
+
 # ====================================================
 # Trade finder helpers (simplified / faster)
 # ====================================================
@@ -1006,6 +1083,25 @@ def build_asset_lists_for_team(team):
     pick_vals.sort(key=lambda x: x[1], reverse=True)
 
     return player_vals, pick_vals
+
+def matches_position_type(player_name: str, selection: str) -> bool:
+    if selection == "Any":
+        return True
+    r = players_df.loc[players_df["Player"] == player_name]
+    if r.empty:
+        return True
+    tier = r["TierLabel"].iloc[0]
+    age = r["Age"].iloc[0] if "Age" in r.columns else np.nan
+
+    if selection == "Young":
+        return (not pd.isna(age)) and (age <= 25)
+    if selection == "Top tier":
+        return tier == "top tier"
+    if selection == "Mid-tier":
+        return tier == "mid-tier"
+    if selection == "Depth":
+        return tier == "depth"
+    return True
 
 def find_offer_for_target_simple(my_team, target_team, target_player_name, tolerance_pct=0.18):
     """Simpler / faster: only single player or player+pick combos."""
@@ -1043,7 +1139,7 @@ def find_offer_for_target_simple(my_team, target_team, target_player_name, toler
             suggestions.append((give_players, give_picks, total, pct_diff))
 
     suggestions.sort(key=lambda x: x[3])
-    return suggestions[:1]  # only need the best idea here
+    return suggestions[:1]  # only the best idea here
 
 def find_return_for_package(
     my_team,
@@ -1106,6 +1202,17 @@ if rosters_df.empty:
     st.error("No rosters found. Check your Sleeper league ID or upload a rosters file.")
     st.stop()
 
+# Random default teams for dropdowns
+if team_list:
+    if len(team_list) >= 2:
+        default_teamA = random.choice(team_list)
+        remaining = [t for t in team_list if t != default_teamA]
+        default_teamB = random.choice(remaining) if remaining else default_teamA
+    else:
+        default_teamA = default_teamB = team_list[0]
+else:
+    default_teamA = default_teamB = None
+
 tab_calc, tab_finder = st.tabs(["🔁 Trade Calculator", "🧭 Trade Finder"])
 
 # -------------------- Trade Calculator --------------------
@@ -1114,11 +1221,21 @@ with tab_calc:
 
     colA, colB = st.columns(2)
     with colA:
-        teamA = st.selectbox("Select first team here", team_list, key="teamA_calc")
+        teamA = st.selectbox(
+            "Select first team here",
+            team_list,
+            index=team_list.index(default_teamA) if default_teamA in team_list else 0,
+            key="teamA_calc",
+        )
         if teamA in team_logo_map:
             st.image(team_logo_map[teamA], width=56)
     with colB:
-        teamB = st.selectbox("Select second team here", team_list, key="teamB_calc")
+        teamB = st.selectbox(
+            "Select second team here",
+            team_list,
+            index=team_list.index(default_teamB) if default_teamB in team_list else 0,
+            key="teamB_calc",
+        )
         if teamB in team_logo_map:
             st.image(team_logo_map[teamB], width=56)
 
@@ -1242,7 +1359,11 @@ with tab_calc:
                 else:
                     st.write("- No dramatic positional shifts; mostly a rankings/value decision.")
                 dfA = format_player_detail_table(A_in_details)
-                st.dataframe(dfA, use_container_width=True, height=min(400, 40 + 30 * max(3, len(dfA))))
+                st.dataframe(
+                    dfA,
+                    use_container_width=True,
+                    height=min(400, 40 + 30 * max(3, len(dfA))),
+                )
                 if A_in_pick_details:
                     st.write("**Incoming picks**")
                     st.dataframe(
@@ -1261,7 +1382,11 @@ with tab_calc:
                 else:
                     st.write("- No dramatic positional shifts; mostly a rankings/value decision.")
                 dfB = format_player_detail_table(B_in_details)
-                st.dataframe(dfB, use_container_width=True, height=min(400, 40 + 30 * max(3, len(dfB))))
+                st.dataframe(
+                    dfB,
+                    use_container_width=True,
+                    height=min(400, 40 + 30 * max(3, len(dfB))),
+                )
                 if B_in_pick_details:
                     st.write("**Incoming picks**")
                     st.dataframe(
@@ -1285,7 +1410,7 @@ with tab_calc:
                 )
                 suggestions.append(
                     "You can also tweak the sliders on the left if you personally "
-                    "value youth, studs, or future picks a bit differently."
+                    "value youth, elite players, or future picks a bit differently."
                 )
             else:
                 suggestions.append(
@@ -1305,7 +1430,18 @@ with tab_finder:
         horizontal=True,
     )
 
-    my_team = st.selectbox("Your team", team_list, key="finder_my_team")
+    # Random default for "my team"
+    if team_list:
+        default_my_team = random.choice(team_list)
+    else:
+        default_my_team = None
+
+    my_team = st.selectbox(
+        "Your team",
+        team_list,
+        index=team_list.index(default_my_team) if default_my_team in team_list else 0,
+        key="finder_my_team",
+    )
     if my_team in team_logo_map:
         st.image(team_logo_map[my_team], width=56)
 
@@ -1317,6 +1453,12 @@ with tab_finder:
             "Positions (optional)",
             ["QB", "RB", "WR", "TE"],
             default=["RB", "WR"],
+        )
+
+        position_type_choice = st.selectbox(
+            "Position type (optional)",
+            ["Any", "Young", "Top tier", "Mid-tier", "Depth"],
+            help="Filter the kinds of players you want to target based on FantasyPros rank and age.",
         )
 
         target_pick_rounds = st.multiselect(
@@ -1331,9 +1473,12 @@ with tab_finder:
             for ot in other_teams:
                 players_other, picks_other = build_asset_lists_for_team(ot)
 
-                # Player targets by position
+                # Player targets by position & tier/age
                 cand_players = [
-                    p for p in players_other if (not target_positions or p[1] in target_positions)
+                    p
+                    for p in players_other
+                    if (not target_positions or p[1] in target_positions)
+                    and matches_position_type(p[0], position_type_choice)
                 ][:5]
 
                 for p in cand_players:
@@ -1409,10 +1554,24 @@ with tab_finder:
                         f"{sug['From']} receives: "
                         f"{', '.join(sug['You Get'])}"
                     )
-                    st.write(
-                        f"Approximate value gap: ~{sug['Approx value gap']*100:.1f}% "
-                        "(values are estimates; league-mate preferences may differ)."
+
+                    # Build explanation using FantasyPros ranks
+                    recv_players = [
+                        asset
+                        for asset in sug["You Get"]
+                        if asset in set(players_df["Player"])
+                    ]
+                    recv_picks = [
+                        asset for asset in sug["You Get"] if asset not in recv_players
+                    ]
+                    expl = build_suggestion_explanation(
+                        sug["You Send players"],
+                        sug["You Send picks"],
+                        recv_players,
+                        recv_picks,
+                        sug["Approx value gap"],
                     )
+                    st.write(expl)
                     st.markdown("---")
 
     else:  # Trade away mode
@@ -1468,10 +1627,15 @@ with tab_finder:
                         f"{', '.join(sug['They Send players']) or 'no players'}; "
                         f"{', '.join(sug['They Send picks']) or 'no picks'}"
                     )
-                    st.write(
-                        f"Approximate value gap: ~{sug['Approx value gap']*100:.1f}% "
-                        "(the closer to 0, the more even the offer)."
+
+                    expl = build_suggestion_explanation(
+                        sug["You Send players"],
+                        sug["You Send picks"],
+                        sug["They Send players"],
+                        sug["They Send picks"],
+                        sug["Approx value gap"],
                     )
+                    st.write(expl)
                     st.markdown("---")
 
 # -------------------- Footer & release notes --------------------
@@ -1489,25 +1653,25 @@ with st.expander("For more information, click here."):
 ### How this calculator works
 
 - **Rankings:** Uses the latest FantasyPros **Dynasty Superflex PPR** expert consensus.
-- **Scoring curves:** Looks at historical PPR scoring by position to understand how fast production falls off (WR1 vs WR20, etc.).
+- **Scoring curves:** Looks at historical PPR scoring by position to understand how fast production falls off (for example, WR1 vs WR20).
 - **Age profiles:** Younger cores get a small bump; older players get a soft haircut, especially at RB.
-- **Positional scarcity:** Positions with fewer reliable options get a **small** premium, but not enough to make a mid TE more valuable than a true stud WR.
-- **Team needs:** Roster needs are a *minor* factor — useful for tiebreakers, not something that overrides rankings.
+- **Positional scarcity:** Positions with fewer reliable options get a **small** premium, but not enough to make a mid TE more valuable than a truly premium WR or QB.
+- **Team needs:** Roster needs are a *minor* factor — helpful for tiebreakers, not something that overrides rankings.
 - **Picks:** Future picks are valued by:
   - Round (1st vs 2nd vs 3rd vs 4th),
   - How strong the original team looks (record + top players),
   - How far out the pick is (further years are slightly discounted),
   - A very small tweak for how many picks a team already has.
-- **Monotonic sanity check:** If a player is ranked ahead of another overall (e.g., WR at #66 vs TE at #77), the lower-ranked player cannot have more model value — even across positions.
+- **Monotonic sanity check:** If a player is ranked ahead of another overall (for example, WR at #66 vs TE at #77), the lower-ranked player cannot have more model value — even across positions.
 
 ### Rough change log
 
 - ✅ Switched from static CSVs to **live FantasyPros + Sleeper**.
 - ✅ Added **future pick valuation** based on original team strength and year.
-- ✅ Smoothed player values so top studs (like elite WRs) pull away more from mid-tier options.
+- ✅ Smoothed player values so top-end options (like elite WRs) pull away more from mid-tier choices.
 - ✅ Added **trade categories** (Perfect Fit → Call the Commissioner) for quick gut checks.
 - ✅ Built a **Trade Finder** with two modes:
-  - “Acquire position/picks” to find ways to target specific spots or draft capital.
+  - “Acquire position/picks” to find ways to target specific spots or draft capital, now with filters for young / top tier / mid-tier / depth.
   - “Trade away” to see what you could reasonably get back for a package.
 - ✅ Tweaked layouts for mobile, simplified the header, and combined context + details into one breakdown section.
 """
