@@ -938,6 +938,7 @@ def trade_category_and_blurb(side_a_value, side_b_value, teamA, teamB, A_desc, B
     bigger = max(side_a_value, side_b_value, 1.0)
     pct = abs(diff) / bigger
 
+    # Categorize the trade
     if pct < 0.07:
         cat = "Perfect Fit"
     elif pct < 0.18:
@@ -949,36 +950,66 @@ def trade_category_and_blurb(side_a_value, side_b_value, teamA, teamB, A_desc, B
     else:
         cat = "Call the Commissioner if They Accept"
 
+    # Build the main summary text
     if abs(diff) < 1e-6:
-        summary = (
+        # Essentially dead even
+        summary_core = (
             "This deal is extremely close in total value. Most managers would see it as pretty fair "
-            "once you factor in rankings, positions, and small team-need tweaks."
+            "once you factor in rankings, positions, and the small team-need adjustments."
         )
     elif diff > 0:
         winner, loser = teamA, teamB
         margin_side = side_a_value - side_b_value
-        summary = (
+        summary_core = (
             f"This trade likely leans toward **{winner}**, by about **{margin_side:,.0f} value "
-            f"points (~{pct*100:.1f}% more value)** than {loser}. "
-            "In practice, that usually means the side getting more value is consolidating slightly better-ranked pieces "
-            "or a bit more future flexibility."
+            f"points (~{pct*100:.1f}% more value)** than {loser}."
         )
     else:
         winner, loser = teamB, teamA
         margin_side = side_b_value - side_a_value
-        summary = (
+        summary_core = (
             f"This trade likely leans toward **{winner}**, by about **{margin_side:,.0f} value "
-            f"points (~{pct*100:.1f}% more value)** than {loser}. "
-            "It's the kind of deal many leagues would still allow, but some managers might push back if they see "
-            "one side stacking more of the higher-ranked assets."
+            f"points (~{pct*100:.1f}% more value)** than {loser}."
         )
 
+    # Tone / explanation depends on category
+    if cat == "Perfect Fit":
+        # No talk of pushback here — just “both sides can feel good”
+        tone = (
+            " The values are about as close as you’ll realistically see, so this is the kind of deal "
+            "both managers can feel comfortable with. It mostly comes down to which roster prefers which mix "
+            "of positions, ages, and future flexibility."
+        )
+    elif cat == "Reasonable":
+        tone = (
+            " There is a slight lean to one side, but it’s still within a range where many managers could reasonably "
+            "accept it, depending on how they personally view the players involved."
+        )
+    elif cat == "Questionable":
+        tone = (
+            " The gap in value is noticeable. It’s not impossible, but it usually requires one manager to be "
+            "significantly higher or lower on specific players than the general market."
+        )
+    elif cat == "Not Good":
+        tone = (
+            " This looks clearly one-sided. It might still be accepted in some leagues, but most managers would see "
+            "one side giving up quite a bit more than they’re getting back."
+        )
+    else:  # "Call the Commissioner if They Accept"
+        tone = (
+            " This is extremely lopsided. If a trade like this went through in most leagues, it would almost certainly "
+            "spark a conversation about fairness and possible vetoes."
+        )
+
+    summary = summary_core + tone
+
+    # Add clear, concrete “who gets what” description underneath
     extra = (
         f"\n\n**{teamA} receives:** {A_desc}\n\n"
         f"**{teamB} receives:** {B_desc}\n\n"
-        "From a big-picture standpoint, think in terms of who is gaining (or giving up) more of the better-ranked, "
-        "core pieces versus depth or future dart throws. The numbers help frame that, but each manager's timeline and "
-        "risk tolerance will tilt things one way or the other."
+        "From a big-picture perspective, think about who is ending up with more of the higher-ranked, long-term pieces "
+        "versus short-term depth or future dart throws. The model leans heavily on FantasyPros dynasty superflex PPR "
+        "ranks, then lightly adjusts for age, position, and each roster’s current shape."
     )
 
     return cat, summary + extra
